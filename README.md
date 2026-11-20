@@ -66,30 +66,34 @@ key/IV service policy unchanged. `ToggleFipsApprovedState` (TestAction 14) is
 available only with Uno `fips_validation_hooks`; it changes firmware approval,
 not BK3 provisioning. These indicators are not evidence of FIPS certification.
 
+The MBOR-only `toggle_fips_approval` test requires one disposable Uno EVB with
+`fips_validation_hooks`. It resets test credentials, provisions and mock-seals
+BK3 if fresh, and reuses an existing mock-sealed BK3 on subsequent runs. Do
+not set `TSRA_USE_TPM`. Unsealed BK3 or an unsupported `GetSealedBk3` is reported
+as a skip. Legacy-sealed BK3 cannot satisfy the approval check.
+
+```bash
+# SDK root: build the host executable without accessing hardware.
+cargo test --release -p tsra_ddi_mbor_test_hooks --test toggle_fips_approval --no-run
+
+# Linux EVB host: copy the executable printed by Cargo as ./toggle_fips_approval.
+env -u TSRA_USE_TPM TSRA_TEST_ARGS=transport=ioctl ./toggle_fips_approval \
+  --ignored --exact test_toggle_fips_approved_state --nocapture
+```
+
+On an approved image, secure provisioning moves a fresh partition to approved
+mode. On a local unapproved image, provisioning alone leaves mode unapproved;
+the test toggles firmware approval to verify the positive case, then restores
+it. On a previously sealed partition, the test checks the transition in both
+directions without reprovisioning.
+
 ### Uno TBOR approval status
 
 The TBOR response header for `PartInfo`, `GetCertificate`, and
 `GetCertChainInfo` reflects firmware approval, independently of MBOR BK3
 provisioning. Other TBOR responses, including ML-KEM/ML-DSA and errors,
-do not assert approval.
-
-For EVB validation, use a lab-only package built with `fips_validation_hooks`.
-Use the default Rust FP package for PQC commands and the `bulk_crypto` package
-when testing legacy bulk FP. On a disposable test partition, open a live MBOR
-session and use `helper_test_action_cmd` with `ToggleFipsApprovedState` (opcode
-2004, action 14, empty payload). Run the MBOR and TBOR checks against the same
-partition via the native `ioctl` transport. Take a baseline before toggling,
-toggle once, repeat the reads, then toggle back and verify the baseline.
-
-On a local image whose measured approval is false, TBOR `PartInfo` and the
-two certificate responses should read false, true, false in that sequence.
-Inspect `ResponseView::fips_approved()` on the raw TBOR response before
-typed decoding, which returns only the response body. TBOR `ApiRev`, PQC
-responses, and error responses should remain false. For MBOR, perform
-`SecureInitBk3` on a fresh test partition before the positive mode check:
-`GetDeviceInfo.data.fips_approved` and ordinary MBOR service indicators
-should follow the toggle once securely provisioned. Without secure BK3,
-the MBOR mode bit must stay false even when the TBOR status reads true.
+do not assert approval. The MBOR test executable does not validate these
+TBOR responses.
 
 Before running any commands below, ensure you have finished the initial setup steps.
 

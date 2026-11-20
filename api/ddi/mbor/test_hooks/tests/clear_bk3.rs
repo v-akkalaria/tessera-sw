@@ -16,22 +16,15 @@ use common::common_cleanup;
 use common::common_setup;
 use common::ddi_dev_test;
 use common::helper_common_establish_credential_no_unwrap;
-use common::helper_get_establish_cred_encryption_key;
 use common::helper_get_sealed_bk3;
-use common::helper_secure_init_bk3;
-use common::helper_set_init_bk3_pin;
-use common::helper_set_sealed_bk3;
+use common::provision_mock_secure_bk3;
 use common::TEST_CRED_ID;
 use common::TEST_CRED_PIN;
-use common::TEST_ECC_384_PRIVATE_KEY;
 use test_with_tracing::test;
-use tsra_cred_encrypt::DeviceCredKey;
-use tsra_crypto::Rng;
 use tsra_ddi::DdiError;
 use tsra_ddi_mbor_test_hooks::helper_test_action_cmd;
 use tsra_ddi_mbor_test_hooks::TestActionRequest;
 use tsra_ddi_mbor_test_hooks::DDI_OP_TEST_ACTION;
-use tsra_ddi_mbor_types::DdiApiRev;
 use tsra_ddi_mbor_types::DdiStatus;
 
 /// Requires mock sealing; TPM-backed provisioning is not supported.
@@ -66,48 +59,7 @@ fn test_clear_bk3() {
             // Clear retains the active credential; NSSR removes it while
             // preserving the allocation and cleared state until the next init.
             common_cleanup(dev, ddi, path, Some(session_id));
-            let phase_one = helper_get_establish_cred_encryption_key(
-                dev,
-                None,
-                Some(DdiApiRev { major: 1, minor: 0 }),
-            )
-            .expect("key fetch after ClearBk3 and NSSR");
-            let (key, pub_key) = DeviceCredKey::new(&phase_one.data.pub_key, phase_one.data.nonce)
-                .expect("PIN tunnel")
-                .create_credential_key_from_der(&TEST_ECC_384_PRIVATE_KEY)
-                .expect("PIN tunnel key");
-            let credential = key
-                .encrypt_establish_credential(TEST_CRED_ID, TEST_CRED_PIN, phase_one.data.nonce)
-                .expect("encrypted provisioning credential");
-            helper_set_init_bk3_pin(dev, credential, pub_key).expect("PIN after ClearBk3");
-
-            let phase_two = helper_get_establish_cred_encryption_key(
-                dev,
-                None,
-                Some(DdiApiRev { major: 1, minor: 0 }),
-            )
-            .expect("replacement BK3 tunnel");
-            let (key, pub_key) = DeviceCredKey::new(&phase_two.data.pub_key, phase_two.data.nonce)
-                .expect("BK3 tunnel")
-                .create_bk3_key_from_der(&TEST_ECC_384_PRIVATE_KEY)
-                .expect("BK3 tunnel key");
-            let mut bk3 = [0; 48];
-            Rng::rand_bytes(&mut bk3).expect("fresh BK3");
-            let encrypted = key
-                .encrypt_bk3(&bk3, TEST_CRED_ID, TEST_CRED_PIN, phase_two.data.nonce)
-                .expect("encrypted BK3");
-            let provisioned = helper_secure_init_bk3(dev, encrypted, pub_key)
-                .expect("reprovision after ClearBk3");
-            let masked = provisioned.data.masked_bk3.as_slice().to_vec();
-            helper_set_sealed_bk3(dev, masked.clone()).expect("reseal after ClearBk3");
-            assert_eq!(
-                helper_get_sealed_bk3(dev)
-                    .expect("read reprovisioned BK3")
-                    .data
-                    .sealed_bk3
-                    .as_slice(),
-                masked.as_slice()
-            );
+            provision_mock_secure_bk3(dev);
             helper_common_establish_credential_no_unwrap(dev, TEST_CRED_ID, TEST_CRED_PIN)
                 .expect("establish with reprovisioned BK3");
         },

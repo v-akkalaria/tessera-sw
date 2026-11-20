@@ -89,12 +89,12 @@ pub const TEST_POTA_ECC_PUB_KEY: [u8; 120] = [
 pub type DdiTest = TsraDdi;
 
 /// Cross-process lock held for one complete hardware-test lifecycle.
-struct HardwareTestLock {
+pub(super) struct HardwareTestLock {
     file: fs::File,
 }
 
 impl HardwareTestLock {
-    fn acquire() -> Self {
+    pub(super) fn acquire() -> Self {
         let path = std::env::temp_dir().join("tsra-ddi-mbor-test-hooks.lock");
         let file = fs::OpenOptions::new()
             .read(true)
@@ -148,7 +148,10 @@ pub fn ddi_dev_test(
 /// Returns the opened session id.
 pub fn common_setup(dev: &mut <DdiTest as Ddi>::Dev, ddi: &DdiTest, path: &str) -> u16 {
     common_cleanup(dev, ddi, path, None);
+    establish_test_session(dev, ddi, path)
+}
 
+pub fn establish_test_session(dev: &<DdiTest as Ddi>::Dev, ddi: &DdiTest, path: &str) -> u16 {
     let mut setup_dev = ddi.open_dev(path).unwrap();
 
     helper_common_establish_credential_no_unwrap(&mut setup_dev, TEST_CRED_ID, TEST_CRED_PIN)
@@ -173,6 +176,46 @@ pub fn common_setup(dev: &mut <DdiTest as Ddi>::Dev, ddi: &DdiTest, path: &str) 
     let resp = resp.unwrap();
     assert!(resp.hdr.sess_id.is_some());
     resp.hdr.sess_id.unwrap()
+}
+
+/// Provision a fresh partition. For mock sealing, store the MOBK verbatim.
+/// Returns the firmware-only approval indicator from `SecureInitBk3`.
+pub fn provision_mock_secure_bk3(dev: &<DdiTest as Ddi>::Dev) -> bool {
+    let rev = Some(DdiApiRev { major: 1, minor: 0 });
+    let phase_one =
+        helper_get_establish_cred_encryption_key(dev, None, rev).expect("PIN tunnel key fetch");
+    let (key, pub_key) = DeviceCredKey::new(&phase_one.data.pub_key, phase_one.data.nonce)
+        .expect("PIN tunnel")
+        .create_credential_key_from_der(&TEST_ECC_384_PRIVATE_KEY)
+        .expect("PIN tunnel key");
+    let credential = key
+        .encrypt_establish_credential(TEST_CRED_ID, TEST_CRED_PIN, phase_one.data.nonce)
+        .expect("encrypted provisioning credential");
+    helper_set_init_bk3_pin(dev, credential, pub_key).expect("SetInitBk3Pin");
+
+    let phase_two =
+        helper_get_establish_cred_encryption_key(dev, None, rev).expect("BK3 tunnel key fetch");
+    let (key, pub_key) = DeviceCredKey::new(&phase_two.data.pub_key, phase_two.data.nonce)
+        .expect("BK3 tunnel")
+        .create_bk3_key_from_der(&TEST_ECC_384_PRIVATE_KEY)
+        .expect("BK3 tunnel key");
+    let mut bk3 = [0; 48];
+    Rng::rand_bytes(&mut bk3).expect("fresh BK3");
+    let encrypted = key
+        .encrypt_bk3(&bk3, TEST_CRED_ID, TEST_CRED_PIN, phase_two.data.nonce)
+        .expect("encrypted BK3");
+    let provisioned = helper_secure_init_bk3(dev, encrypted, pub_key).expect("SecureInitBk3");
+    let masked = provisioned.data.masked_bk3.as_slice();
+    helper_set_sealed_bk3(dev, masked.to_vec()).expect("SetSealedBk3");
+    assert_eq!(
+        helper_get_sealed_bk3(dev)
+            .expect("read provisioned BK3")
+            .data
+            .sealed_bk3
+            .as_slice(),
+        masked
+    );
+    provisioned.hdr.fips_approved
 }
 
 /// Close the session (if any) and erase the device.
