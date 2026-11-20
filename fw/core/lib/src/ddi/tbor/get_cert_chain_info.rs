@@ -22,6 +22,8 @@ use tsra_fw_hsm_pal_traits::HsmCmdBuf;
 use tsra_fw_hsm_pal_traits::HsmPal;
 use tsra_fw_hsm_pal_traits::HsmResult;
 
+use crate::part_state::part_firmware_fips_approved;
+
 /// Handle a TBOR `GetCertChainInfo` request.
 ///
 /// Slot 2 generates a fresh PID leaf and fingerprints it; because each read
@@ -34,6 +36,7 @@ pub(crate) async fn handle<P: HsmPal>(
 ) -> HsmResult<usize> {
     let req = TborGetCertChainInfoReq::decode(cmd_buf.request())?;
     let slot = HsmCertSlot(req.slot_id());
+    let fips_approved = part_firmware_fips_approved(pal, io)?;
 
     let info = if slot == HsmCertSlot::PartOwner {
         super::pta::chain_info(pal, io).await?
@@ -42,7 +45,7 @@ pub(crate) async fn handle<P: HsmPal>(
     };
 
     let resp = cmd_buf.encode_response(|buf| {
-        let frame = TborGetCertChainInfoResp::encode(buf, 0, false)?
+        let frame = TborGetCertChainInfoResp::encode(buf, 0, fips_approved)?
             .num_certs(info.count)?
             .thumbprint(&info.thumbprint)?
             .finish();

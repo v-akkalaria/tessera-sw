@@ -27,11 +27,6 @@ use tsra_fw_hsm_pal_traits::HsmResult;
 
 use crate::part_state;
 
-/// Module FIPS approval status carried in the TBOR response header flag.
-/// `false` matches the MBOR `get_device_info` handler — uno firmware is
-/// not yet FIPS-approved.
-const FIPS_APPROVED: bool = false;
-
 /// Length of a raw P-384 identity public key (`x || y`, 48-byte coordinates).
 const P384_PUB_RAW_LEN: usize = 2 * 48;
 
@@ -56,9 +51,11 @@ pub(crate) async fn handle<P: HsmPal>(
     let mfgr_svn = part_state::part_mfgr_svn(pal);
     let pid = part_state::part_id(pal, io)?;
     let sd_initialized = u8::from(part_state::part_is_sd_initialized(pal, io)?);
+    // TBOR reports firmware approval, not MBOR's BK3 provisioning state.
+    let fips_approved = part_state::part_firmware_fips_approved(pal, io)?;
 
     let resp = cmd_buf.encode_response(|buf| {
-        let frame = TborPartInfoResp::encode(buf, 0, FIPS_APPROVED)?
+        let frame = TborPartInfoResp::encode(buf, 0, fips_approved)?
             .device_kind(DeviceKind::Physical)?
             .part_state(PartStateId(part_state_val))?
             .generation(U32::new(generation))?

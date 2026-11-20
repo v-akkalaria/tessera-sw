@@ -140,7 +140,15 @@ impl HsmCryptoOrder for StdHsmPal {
 mod fips_tests {
     use tsra_ddi_mbor_codec::MborEncode;
     use tsra_ddi_mbor_types::*;
+    use tsra_ddi_tbor_codec::ResponseView;
+    use tsra_ddi_tbor_types::TborApiRevReq;
+    use tsra_ddi_tbor_types::TborGetCertChainInfoReq;
+    use tsra_ddi_tbor_types::TborGetCertReq;
+    use tsra_ddi_tbor_types::TborOpReq;
+    use tsra_ddi_tbor_types::TborPartInfoReq;
     use tsra_fw_hsm_core::Hsm;
+    use tsra_fw_hsm_core::OP_MBOR;
+    use tsra_fw_hsm_core::OP_TBOR;
 
     use super::*;
 
@@ -155,15 +163,25 @@ mod fips_tests {
         revision: Option<DdiApiRev>,
     ) -> Vec<u8> {
         let mut src = Page([0; 4096]);
-        let mut dst = Page([0; 4096]);
         let hdr = DdiReqHdr {
             rev: revision,
             op,
             sess_id: None,
         };
         let len = DdiEncoder::encode_parts(hdr, body, &mut src.0, false).unwrap();
+        execute_wire(hsm, submit, OP_MBOR, &src, len).await
+    }
+
+    async fn execute_wire(
+        hsm: &Hsm<StdHsmPal>,
+        submit: &async_channel::Sender<HsmIoRequest>,
+        opcode: u16,
+        src: &Page,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut dst = Page([0; 4096]);
         let mut sqe = tsra_fw_hsm_io::SqeEntry::default();
-        sqe.0[0] = 1 << 16;
+        sqe.0[0] = (1 << 16) | u32::from(opcode);
         sqe.0[1] = len as u32;
         let source = src.0.as_ptr() as u64;
         sqe.0[2] = source as u32;
@@ -183,6 +201,55 @@ mod fips_tests {
         assert_eq!(cqe[3] >> 17, 0, "transport failure");
         let len = (cqe[0] & 0xFFFF) as usize;
         dst.0[..len].to_vec()
+    }
+
+    async fn tbor_status(
+        hsm: &Hsm<StdHsmPal>,
+        submit: &async_channel::Sender<HsmIoRequest>,
+        req: impl TborOpReq,
+    ) -> (u32, bool) {
+        let mut src = Page([0; 4096]);
+        let len = req.encode_request(&mut src.0).unwrap().len();
+        let bytes = execute_wire(hsm, submit, OP_TBOR, &src, len).await;
+        let resp = ResponseView::parse(&bytes).unwrap();
+        (resp.status(), resp.fips_approved())
+    }
+
+    #[tokio::test]
+    async fn tbor_fips_status_and_certificate_service_indicators() {
+        let (submit, receive) = async_channel::bounded(1);
+        let pal = StdHsmPal::new(receive, tokio::runtime::Handle::current());
+        pal.init_cert_store().await.unwrap();
+        pal.part_alloc_internal(0, 1).await.unwrap();
+        pal.part_enable_internal(0).await.unwrap();
+        let hsm = Hsm::new(pal);
+        let pid = HsmPartId::from(0u8);
+
+        for approved in [false, true, false] {
+            hsm.pal().test_set_firmware_fips_approved(pid, approved);
+            assert_eq!(info(&hsm, &submit).await, (true, false));
+
+            assert_eq!(
+                tbor_status(&hsm, &submit, TborApiRevReq::new()).await,
+                (0, false)
+            );
+            assert_eq!(
+                tbor_status(&hsm, &submit, TborPartInfoReq::new()).await,
+                (0, approved)
+            );
+            assert_eq!(
+                tbor_status(&hsm, &submit, TborGetCertChainInfoReq::new(0)).await,
+                (0, approved)
+            );
+            assert_eq!(
+                tbor_status(&hsm, &submit, TborGetCertReq::new(0, 0)).await,
+                (0, approved)
+            );
+            assert_eq!(
+                tbor_status(&hsm, &submit, TborGetCertReq::new(0, u8::MAX)).await,
+                (HsmError::InvalidArg.0, false)
+            );
+        }
     }
 
     async fn info(

@@ -27,6 +27,8 @@ use tsra_fw_hsm_pal_traits::HsmError;
 use tsra_fw_hsm_pal_traits::HsmPal;
 use tsra_fw_hsm_pal_traits::HsmResult;
 
+use crate::part_state::part_firmware_fips_approved;
+
 /// Handle a TBOR `GetCertificate` request.
 ///
 /// Slot 2 generates one fresh PTA-issued PID certificate from the
@@ -40,6 +42,7 @@ pub(crate) async fn handle<P: HsmPal>(
     let req = TborGetCertReq::decode(cmd_buf.request())?;
     let slot = HsmCertSlot(req.slot_id());
     let cert_id = req.cert_id();
+    let fips_approved = part_firmware_fips_approved(pal, io)?;
 
     if slot == HsmCertSlot::PartOwner {
         if cert_id != 0 {
@@ -47,7 +50,7 @@ pub(crate) async fn handle<P: HsmPal>(
         }
         let cert = super::pta::pid_certificate(pal, io).await?;
         let resp = cmd_buf.encode_response(|buf| {
-            let frame = TborGetCertResp::encode(buf, 0, false)?
+            let frame = TborGetCertResp::encode(buf, 0, fips_approved)?
                 .certificate(cert)?
                 .finish();
             Ok(frame.as_bytes().len())
@@ -70,7 +73,7 @@ pub(crate) async fn handle<P: HsmPal>(
     // unwritten), then have the PAL copy the DER bytes straight into the
     // reserved slot — no scratch buffer and no copy.
     let resp = cmd_buf.encode_response(|buf| {
-        let frame = TborGetCertResp::encode(buf, 0, false)?
+        let frame = TborGetCertResp::encode(buf, 0, fips_approved)?
             .certificate_reserve(len)?
             .finish();
         Ok(frame.as_bytes().len())

@@ -65,7 +65,31 @@ Legacy bulk FP receives the effective partition approval, with its existing
 key/IV service policy unchanged. `ToggleFipsApprovedState` (TestAction 14) is
 available only with Uno `fips_validation_hooks`; it changes firmware approval,
 not BK3 provisioning. These indicators are not evidence of FIPS certification.
-TBOR/PQC approval policy is separate and its response flags remain false.
+
+### Uno TBOR approval status
+
+The TBOR response header for `PartInfo`, `GetCertificate`, and
+`GetCertChainInfo` reflects firmware approval, independently of MBOR BK3
+provisioning. Other TBOR responses, including ML-KEM/ML-DSA and errors,
+do not assert approval.
+
+For EVB validation, use a lab-only package built with `fips_validation_hooks`.
+Use the default Rust FP package for PQC commands and the `bulk_crypto` package
+when testing legacy bulk FP. On a disposable test partition, open a live MBOR
+session and use `helper_test_action_cmd` with `ToggleFipsApprovedState` (opcode
+2004, action 14, empty payload). Run the MBOR and TBOR checks against the same
+partition via the native `ioctl` transport. Take a baseline before toggling,
+toggle once, repeat the reads, then toggle back and verify the baseline.
+
+On a local image whose measured approval is false, TBOR `PartInfo` and the
+two certificate responses should read false, true, false in that sequence.
+Inspect `ResponseView::fips_approved()` on the raw TBOR response before
+typed decoding, which returns only the response body. TBOR `ApiRev`, PQC
+responses, and error responses should remain false. For MBOR, perform
+`SecureInitBk3` on a fresh test partition before the positive mode check:
+`GetDeviceInfo.data.fips_approved` and ordinary MBOR service indicators
+should follow the toggle once securely provisioned. Without secure BK3,
+the MBOR mode bit must stay false even when the TBOR status reads true.
 
 Before running any commands below, ensure you have finished the initial setup steps.
 
