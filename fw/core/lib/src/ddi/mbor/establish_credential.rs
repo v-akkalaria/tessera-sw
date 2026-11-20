@@ -757,8 +757,10 @@ async fn encode_bmk_response<'p, P: HsmPal>(
 
     // Reserve the response buffer (encoder-frame-then-fill pattern).
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
-        let mut encoder =
-            super::encode_resp_hdr(&super::success_hdr(hdr, DdiOp::EstablishCredential), buf)?;
+        let mut encoder = super::encode_resp_hdr(
+            &super::success_hdr(pal, io, hdr, DdiOp::EstablishCredential)?,
+            buf,
+        )?;
         let layout = DdiEstablishCredentialResp::reserve(&mut encoder, bmk_len)?;
         Ok((encoder.position(), layout))
     })?;

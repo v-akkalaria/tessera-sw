@@ -101,7 +101,7 @@ pub(crate) async fn ecc_generate_key_pair<'p, P: HsmPal>(
 
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr_sess(hdr, DdiOp::EccGenerateKeyPair, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::EccGenerateKeyPair, sess_id)?,
             buf,
         )?;
         let layout = DdiEccGenerateKeyPairResp::reserve(

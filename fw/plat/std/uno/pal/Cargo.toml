@@ -26,5 +26,8 @@ zeroize.workspace = true
 trace-io = []
 
 [dev-dependencies]
+tsra_ddi_mbor_codec.workspace = true
+tsra_ddi_mbor_types.workspace = true
+tsra_fw_hsm_core.workspace = true
 hex.workspace = true
 tokio = { features = ["macros", "rt", "sync", "time"], workspace = true }

@@ -45,6 +45,28 @@ Windows CNG; verification accepts either signature variant.
 
 ## Build Commands
 
+### Uno MBOR approval status
+
+For API 1.x, `GetDeviceInfo.data.fips_approved` is true only when the boot
+measurements report approved firmware and BK3 was initialized securely.
+Legacy `InitBk3`, unprovisioned partitions and unknown provisioning states
+remain unapproved. Secure provisioning survives NSSR; free and `ClearBk3`
+revoke approval. The simulator defaults to unapproved firmware.
+
+The response header's `fips_approved` is a per-service indicator, not the
+device status. Discovery (`GetApiRev`, `GetDeviceInfo`) reports true;
+secure-provisioning setup uses firmware approval alone; ordinary MBOR
+services use effective partition approval. Legacy initialization, raw digest,
+test/debug services and error responses report false. In approved mode, ECC
+signing rejects SHA-1 and enforces P-256/SHA-256, P-384/SHA-256 or SHA-384,
+and P-521/SHA-256, SHA-384 or SHA-512.
+
+Legacy bulk FP receives the effective partition approval, with its existing
+key/IV service policy unchanged. `ToggleFipsApprovedState` (TestAction 14) is
+available only with Uno `fips_validation_hooks`; it changes firmware approval,
+not BK3 provisioning. These indicators are not evidence of FIPS certification.
+TBOR/PQC approval policy is separate and its response flags remain false.
+
 Before running any commands below, ensure you have finished the initial setup steps.
 
 ### Building

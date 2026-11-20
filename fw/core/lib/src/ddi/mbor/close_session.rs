@@ -41,7 +41,7 @@ pub(crate) async fn close_session<'p, P: HsmPal>(
     // host can confirm which session was torn down.
     let resp = pal.dma_alloc_var(io, |buf| {
         super::encode_resp(
-            &super::success_hdr_sess(hdr, DdiOp::CloseSession, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::CloseSession, sess_id)?,
             &DdiCloseSessionResp {},
             buf,
         )

@@ -30,6 +30,7 @@ pub(super) async fn dispatch<'p>(
 
     // Nothing is cleared if response allocation/encoding fails.
     let resp = encode_success(pal, io, hdr)?;
+    pal.set_fp_fips_approved(io.pid(), false);
     part.clear_bk3_info();
     Ok(resp)
 }

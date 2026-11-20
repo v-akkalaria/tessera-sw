@@ -51,7 +51,7 @@ pub(crate) async fn get_session_encryption_key<'p, P: HsmPal>(
 
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr(hdr, DdiOp::GetSessionEncryptionKey),
+            &super::success_hdr(pal, io, hdr, DdiOp::GetSessionEncryptionKey)?,
             buf,
         )?;
         let layout = DdiGetSessionEncryptionKeyResp::reserve(

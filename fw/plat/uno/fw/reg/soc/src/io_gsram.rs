@@ -79,6 +79,10 @@ pub const BCP_DFL_STRIDE: u32 = 0x80;
 pub const IO_META_OFFSET: u32 = 0x20C58;
 pub const IO_META_COUNT: u32 = 33;
 pub const IO_META_STRIDE: u32 = 0x08;
+pub const POR_MEASUREMENTS_OFFSET: u32 = 0x00;
+pub const POR_MEASUREMENTS_COUNT: u32 = 1;
+pub const POR_MEASUREMENTS_STRIDE: u32 = 0xAF0;
+pub const POR_MEASUREMENTS_SIZE: u32 = 0xAF0;
 pub const BKS_TABLE_OFFSET: u32 = 0x1110;
 pub const BKS_TABLE_COUNT: u32 = 12;
 pub const BKS_TABLE_STRIDE: u32 = 0x29;
@@ -440,7 +444,8 @@ pub mod regs {
     //! MMIO register struct for firmware use.
     tock_registers::register_structs! {
         pub IoGsramRegs {
-            (0x0 => _reserved0),
+            (0x0 => pub por_measurements: [u8; 2800]),
+            (0xaf0 => _reserved0),
             (0x1110 => pub bks_table: [u8; 492]),
             (0x12fc => pub sp_fips_provisioned_keys: [u8; 48]),
             (0x132c => pub cp_fips_provisioned_keys: [u8; 48]),

@@ -51,7 +51,7 @@ pub(crate) async fn set_sealed_bk3<'p, P: HsmPal>(
         return Err(HsmError::SealedBk3TooLarge);
     }
 
-    let resp_hdr = super::success_hdr(hdr, DdiOp::SetSealedBk3);
+    let resp_hdr = super::success_hdr(pal, io, hdr, DdiOp::SetSealedBk3)?;
     let resp_data = DdiSetSealedBk3Resp {};
 
     let resp = pal.dma_alloc_var(io, |buf| super::encode_resp(&resp_hdr, &resp_data, buf))?;

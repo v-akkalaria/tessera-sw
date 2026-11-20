@@ -41,8 +41,10 @@ pub(crate) async fn get_certificate<'p, P: HsmPal>(
     // as the closure's owned out-value. After the closure, rebind the
     // layout against the populated buffer to fill the slot.
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
-        let mut encoder =
-            super::encode_resp_hdr(&super::success_hdr(hdr, DdiOp::GetCertificate), buf)?;
+        let mut encoder = super::encode_resp_hdr(
+            &super::success_hdr(pal, io, hdr, DdiOp::GetCertificate)?,
+            buf,
+        )?;
         let layout = DdiGetCertificateResp::reserve(&mut encoder, len)?;
         Ok((encoder.position(), layout))
     })?;

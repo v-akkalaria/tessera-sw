@@ -42,6 +42,11 @@ pub(crate) async fn ecc_sign<'p, P: HsmPal>(
     let key_id = HsmKeyId::from(body.key_id);
     let vault_kind = pal.vault_key_kind(io, key_id)?;
     let curve = super::from_pal::ecc_curve(vault_kind)?;
+    validate_fips_digest(
+        crate::part_state::part_fips_approved(pal, io)?,
+        curve,
+        body.digest_algo,
+    )?;
     let vault_attrs = pal.vault_key_attrs(io, key_id)?;
     if !vault_attrs.sign() {
         return Err(HsmError::InvalidPermissions);
@@ -53,8 +58,10 @@ pub(crate) async fn ecc_sign<'p, P: HsmPal>(
     // reserve `curve.wire_sig_len(P::BYTE_ORDER)` bytes and hand the slot through.
     let wire_len = curve.wire_sig_len(P::BYTE_ORDER);
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
-        let mut encoder =
-            super::encode_resp_hdr(&super::success_hdr_sess(hdr, DdiOp::EccSign, sess_id), buf)?;
+        let mut encoder = super::encode_resp_hdr(
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::EccSign, sess_id)?,
+            buf,
+        )?;
         let layout = DdiEccSignResp::reserve(&mut encoder, wire_len)?;
         Ok((encoder.position(), layout))
     })?;
@@ -120,4 +127,68 @@ pub(crate) async fn ecc_sign<'p, P: HsmPal>(
     .await?;
 
     Ok(resp)
+}
+
+fn validate_fips_digest(
+    approved: bool,
+    curve: HsmEccCurve,
+    digest: DdiHashAlgorithm,
+) -> HsmResult<()> {
+    if !approved {
+        return Ok(());
+    }
+    if digest == DdiHashAlgorithm::Sha1 {
+        return Err(HsmError::NonFipsApprovedDigest);
+    }
+    let valid = match curve {
+        HsmEccCurve::P256 => digest == DdiHashAlgorithm::Sha256,
+        HsmEccCurve::P384 => matches!(digest, DdiHashAlgorithm::Sha256 | DdiHashAlgorithm::Sha384),
+        HsmEccCurve::P521 => matches!(
+            digest,
+            DdiHashAlgorithm::Sha256 | DdiHashAlgorithm::Sha384 | DdiHashAlgorithm::Sha512
+        ),
+    };
+    if !valid {
+        return Err(HsmError::DigestHashMismatchWithEccCurve);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approved_ecc_signing_enforces_digest_policy() {
+        for curve in [HsmEccCurve::P256, HsmEccCurve::P384, HsmEccCurve::P521] {
+            assert_eq!(
+                validate_fips_digest(false, curve, DdiHashAlgorithm::Sha1),
+                Ok(())
+            );
+            assert_eq!(
+                validate_fips_digest(true, curve, DdiHashAlgorithm::Sha1),
+                Err(HsmError::NonFipsApprovedDigest)
+            );
+            assert_eq!(
+                validate_fips_digest(true, curve, DdiHashAlgorithm::Sha256),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_fips_digest(true, HsmEccCurve::P256, DdiHashAlgorithm::Sha384),
+            Err(HsmError::DigestHashMismatchWithEccCurve)
+        );
+        assert_eq!(
+            validate_fips_digest(true, HsmEccCurve::P384, DdiHashAlgorithm::Sha512),
+            Err(HsmError::DigestHashMismatchWithEccCurve)
+        );
+        assert_eq!(
+            validate_fips_digest(true, HsmEccCurve::P384, DdiHashAlgorithm::Sha384),
+            Ok(())
+        );
+        assert_eq!(
+            validate_fips_digest(true, HsmEccCurve::P521, DdiHashAlgorithm::Sha512),
+            Ok(())
+        );
+    }
 }

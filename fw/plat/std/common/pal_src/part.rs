@@ -256,6 +256,8 @@ pub(crate) struct PartitionEntry {
     bk3_prov_credential: [u8; 32],
     bk3_prov_credential_set: bool,
     fips_provisioning_status: u8,
+    /// Simulated firmware status, false outside explicit unit-test setup.
+    firmware_fips_approved: bool,
 
     /// Security-domain initialization state for the current partition
     /// incarnation.
@@ -344,6 +346,7 @@ impl Default for PartitionEntry {
             bk3_prov_credential: [0u8; 32],
             bk3_prov_credential_set: false,
             fips_provisioning_status: 0,
+            firmware_fips_approved: false,
             sd_initialized: false,
             credential: [0u8; 32],
             credential_set: false,
@@ -593,6 +596,11 @@ impl HsmPartitionManager for StdHsmPal {
 // ---------------------------------------------------------------------------
 
 impl StdHsmPal {
+    #[cfg(test)]
+    pub(crate) fn test_set_firmware_fips_approved(&self, pid: HsmPartId, approved: bool) {
+        self.table_mut().entries[usize::from(u8::from(pid))].firmware_fips_approved = approved;
+    }
+
     /// Borrow the `PartitionTable` through the `UnsafeCell`.  Safe
     /// because the std PAL runs on a single-threaded Embassy executor
     /// (see the module-level architecture note).
@@ -1315,6 +1323,10 @@ impl PartitionEntry {
             HsmPartPropId::PART_RES_COUNT => Ok(self.res_mask.count_ones()),
             HsmPartPropId::BK3_INITIALIZED => Ok(u32::from(self.bk3_initialized)),
             HsmPartPropId::SD_INITIALIZED => Ok(u32::from(self.sd_initialized)),
+            HsmPartPropId::FIRMWARE_FIPS_APPROVED => Ok(u32::from(self.firmware_fips_approved)),
+            HsmPartPropId::FIPS_APPROVED => Ok(u32::from(
+                self.firmware_fips_approved && self.fips_provisioning_status == 1,
+            )),
             HsmPartPropId::PART_ID_ECC_KEY_ID => key_id_to_u32(self.id_key_id),
             HsmPartPropId::MK_KEY_ID => key_id_to_u32(self.mk_key_id),
             HsmPartPropId::UPS_KEY_ID => key_id_to_u32(self.ups_key_id),
@@ -1818,6 +1830,32 @@ impl StdHsmPal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fips_approval_requires_firmware_and_secure_provisioning() {
+        let pal = StdHsmPal::default();
+        pal.table_mut().entries[0].state = HsmPartState::Enabled;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let io = StdHsmIo::admin(HsmPartId::from(0u8), 0, tx);
+        for firmware in [false, true] {
+            pal.test_set_firmware_fips_approved(io.pid(), firmware);
+            for status in [0, 1, 2, u8::MAX] {
+                pal.table_mut().entries[0].fips_provisioning_status = status;
+                assert_eq!(
+                    pal.part_prop_get_bool(&io, HsmPartPropId::FIPS_APPROVED),
+                    Ok(firmware && status == 1)
+                );
+            }
+        }
+        assert_eq!(
+            pal.part_prop_set_bool(&io, HsmPartPropId::FIPS_APPROVED, true),
+            Err(HsmError::InvalidArg)
+        );
+        assert_eq!(
+            pal.part_prop_set_bool(&io, HsmPartPropId::FIRMWARE_FIPS_APPROVED, true),
+            Err(HsmError::InvalidArg)
+        );
+    }
 
     #[tokio::test]
     async fn lazy_unwrapping_key_pct_failure_does_not_publish_key() {

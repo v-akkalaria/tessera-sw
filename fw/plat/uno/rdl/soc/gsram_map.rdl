@@ -30,6 +30,11 @@
 // Hardware alignment: UCD and GDMA hardware expect queue base
 // addresses to be 32-byte (0x20) aligned.
 
+mem por_measurements_t {
+    desc = "SP-published boot measurements (2799 bytes) and firmware approval byte.";
+    mementries = 2800;
+    memwidth = 8;
+};
 
 // ══════════════════════════════════════════════════════════════
 // BKS Table (device-global, SP-populated, read-only)
@@ -679,6 +684,8 @@ addrmap io_gsram {
 
     default hw = na;
     default sw = rw;
+
+    por_measurements_t POR_MEASUREMENTS @ 0x00000;
 
     // ─── BKS table (device-global, SP-populated): 12 × 41-byte entries ───
     bks_table_entry_t BKS_TABLE[12]    @ 0x01110 += 0x29;  // 0x1110 - 0x12FC

@@ -121,6 +121,16 @@ use zeroize::Zeroize;
 
 use super::*;
 
+/// Firmware approval independent of BK3 provisioning.
+pub fn part_firmware_fips_approved<P: HsmPartitionManager>(pal: &P, io: &P::Io) -> HsmResult<bool> {
+    pal.part_prop_get_bool(io, HsmPartPropId::FIRMWARE_FIPS_APPROVED)
+}
+
+/// Effective MBOR mode; legacy and unprovisioned partitions are not approved.
+pub fn part_fips_approved<P: HsmPartitionManager>(pal: &P, io: &P::Io) -> HsmResult<bool> {
+    pal.part_prop_get_bool(io, HsmPartPropId::FIPS_APPROVED)
+}
+
 // ─── Identity, lifecycle, and platform state ──────────────────────────────
 //
 // Properties that name *what* this partition is and *where* it is in

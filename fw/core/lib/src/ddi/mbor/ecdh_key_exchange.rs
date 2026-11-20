@@ -113,7 +113,7 @@ pub(crate) async fn ecdh_key_exchange<'p, P: HsmPal>(
 
         let resp = pal.dma_alloc_var(io, |buf| {
             super::encode_resp(
-                &super::success_hdr_sess(hdr, DdiOp::EcdhKeyExchange, sess_id),
+                &super::success_hdr_sess(pal, io, hdr, DdiOp::EcdhKeyExchange, sess_id)?,
                 &DdiEcdhKeyExchangeResp { key_id, masked_key },
                 buf,
             )

@@ -73,7 +73,7 @@ pub(crate) async fn aes_encrypt_decrypt<'p, P: HsmPal>(
     // pass both to the PAL call without overlap.
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr_sess(hdr, DdiOp::AesEncryptDecrypt, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::AesEncryptDecrypt, sess_id)?,
             buf,
         )?;
         let layout = DdiAesEncryptDecryptResp::reserve(&mut encoder, msg_len, AES_BLOCK_LEN)?;

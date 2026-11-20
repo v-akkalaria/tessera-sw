@@ -64,6 +64,9 @@ enum SupportedTestAction {
     /// Clear the partition's stored user credential.
     #[cfg(feature = "tsra_test_hooks")]
     ClearUserCredentials = 18,
+    /// Toggle firmware approval without changing the BK3 classification.
+    #[cfg(feature = "fips_validation_hooks")]
+    ToggleFipsApprovedState = 14,
     /// Clear persistent BK3 provisioning state.
     #[cfg(feature = "fips_validation_hooks")]
     ClearBk3 = 22,
@@ -100,6 +103,10 @@ impl TryFrom<u32> for SupportedTestAction {
             return Ok(Self::ClearUserCredentials);
         }
         #[cfg(feature = "fips_validation_hooks")]
+        if value == Self::ToggleFipsApprovedState as u32 {
+            return Ok(Self::ToggleFipsApprovedState);
+        }
+        #[cfg(feature = "fips_validation_hooks")]
         if value == Self::ClearBk3 as u32 {
             return Ok(Self::ClearBk3);
         }
@@ -130,6 +137,15 @@ pub(super) async fn dispatch<'p>(
     let selector = decode_action_selector(decoder)?;
 
     match selector.action {
+        #[cfg(feature = "fips_validation_hooks")]
+        SupportedTestAction::ToggleFipsApprovedState => {
+            use tsra_fw_hsm_pal_traits::HsmPartitionLock;
+            expect_empty_payload(decoder, selector.request_field_count, request_len)?;
+            let _lock = pal.partition_lock(io).await?;
+            let resp = encode_success(pal, io, hdr)?;
+            pal.toggle_firmware_fips_approval(io.pid())?;
+            Ok(resp)
+        }
         #[cfg(feature = "fips_validation_hooks")]
         SupportedTestAction::ClearBk3 => {
             clear_bk3::dispatch(

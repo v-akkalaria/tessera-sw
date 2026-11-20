@@ -12,7 +12,7 @@
 //!
 //! | Kind | Encrypt IV | Decrypt IV | Service indicator |
 //! |---|---|---|---|
-//! | `AesGcmBulk256` | HSM-generated | host | approved |
+//! | `AesGcmBulk256` | HSM-generated | host | approved only in approved mode |
 //! | `AesGcmBulk256Unapproved` | host | host | not approved |
 
 use tsra_fw_hsm_bulk::*;
@@ -72,7 +72,7 @@ impl HsmBulkCrypto for StdHsmPal {
             BulkParams::Gcm(gcm) => self.bulk_gcm(io, &sqe, gcm, &mut cqe).await?,
             BulkParams::Xts(xts) => {
                 self.bulk_xts(io, &sqe, xts).await?;
-                cqe.fips_approved = true;
+                cqe.fips_approved = self.part_prop_get_bool(io, HsmPartPropId::FIPS_APPROVED)?;
             }
         }
         let StdCqe::Bulk(entry) = &mut io.cqe else {
@@ -191,7 +191,8 @@ impl StdHsmPal {
         }
 
         cqe.iv = iv;
-        cqe.fips_approved = approved;
+        cqe.fips_approved =
+            approved && self.part_prop_get_bool(io, HsmPartPropId::FIPS_APPROVED)?;
         Ok(())
     }
 
@@ -247,6 +248,10 @@ mod tests {
         let (_tx, rx) = async_channel::bounded(1);
         let pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
         pal.part_alloc_internal(PID, 0b11).await.unwrap();
+        pal.test_set_firmware_fips_approved(HsmPartId::from(PID), true);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let io = StdHsmIo::admin(HsmPartId::from(PID), 0, tx);
+        pal.part_commit_bk3(&io, true, None).unwrap();
         pal
     }
 
@@ -417,6 +422,23 @@ mod tests {
         pal.bulk_crypt(&mut io).await.unwrap();
         assert!(cqe(&mut io).fips_approved);
         assert_eq!(dec.output(0, pt.len()), pt);
+    }
+
+    #[tokio::test]
+    async fn approved_bulk_key_keeps_iv_policy_when_mode_is_unapproved() {
+        let pal = setup().await;
+        let kid = add_key(&pal, &[0x6bu8; 32], HsmVaultKeyKind::AesGcmBulk256, None);
+        pal.test_set_firmware_fips_approved(HsmPartId::from(PID), false);
+        let pt = [0x42u8; 32];
+        let mut enc = GcmIo::new(&[], &pt);
+        let mut io = bulk_io(enc.entry(BulkDir::Encrypt, kid, 0, pt.len(), [0; 12], [0; 16]));
+        pal.bulk_crypt(&mut io).await.unwrap();
+        let c = cqe(&mut io);
+        assert!(!c.fips_approved);
+        assert_ne!(
+            c.iv, [0; 12],
+            "mode must not weaken HSM-generated IV policy"
+        );
     }
 
     fn xts_entry(

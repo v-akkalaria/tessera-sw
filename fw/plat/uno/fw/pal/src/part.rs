@@ -271,6 +271,7 @@ impl UnoHsmPal {
     /// partition stays allocated so the free can be retried.
     pub(crate) async fn part_free(&self, pid: HsmPartId) -> HsmResult<()> {
         let part = PartStore::partition(pid)?;
+        self.set_fp_fips_approved(pid, false);
         if part.state()? == HsmPartState::Unallocated {
             return Ok(());
         }
@@ -523,6 +524,7 @@ impl UnoHsmPal {
         let Ok(part) = PartStore::partition(pid) else {
             return;
         };
+        self.set_fp_fips_approved(pid, false);
         // Delete every enable-time and provisioning vault key before the
         // backing handles are zeroized below.
         for key_id in [
@@ -620,6 +622,7 @@ impl UnoHsmPal {
         let part = PartStore::partition(pid)?;
         match part.state()? {
             HsmPartState::Enabled => {
+                self.set_fp_fips_approved(pid, false);
                 self.with_admin_io(pid, async |admin_io, _alloc| -> HsmResult<()> {
                     let sessions = SessionStore::partition(pid)?;
                     for (slot, key_id) in sessions.occupied_physical_ids().into_iter().enumerate() {
@@ -833,6 +836,7 @@ impl HsmPartitionManager for UnoHsmPal {
         }
         part.set_bk3_initialized(true);
         part.set_fips_status(if secure { 1 } else { 2 });
+        self.set_fp_fips_approved(io.pid(), secure && self.firmware_fips_approved(io.pid()));
         Ok(())
     }
 
@@ -968,6 +972,10 @@ impl HsmPartitionManager for UnoHsmPal {
     fn part_prop_get_bool(&self, io: &UnoHsmIo, id: HsmPartPropId) -> HsmResult<bool> {
         let part = PartStore::partition(io.pid())?;
         match id {
+            HsmPartPropId::FIRMWARE_FIPS_APPROVED => Ok(self.firmware_fips_approved(io.pid())),
+            HsmPartPropId::FIPS_APPROVED => {
+                Ok(self.firmware_fips_approved(io.pid()) && part.fips_status() == 1)
+            }
             HsmPartPropId::BK3_INITIALIZED => Ok(part.bk3_initialized()),
             HsmPartPropId::SD_INITIALIZED => Ok(part.sd_initialized()),
             _ => Err(HsmError::UnsupportedCmd),

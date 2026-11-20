@@ -27,13 +27,13 @@ pub(crate) fn get_device_info<'p, P: HsmPal>(
 
     let resp_data = DdiGetDeviceInfoResp {
         kind: DdiDeviceKind::Physical,
-        tables: crate::part_state::part_res_count(pal, io).unwrap_or(0),
-        fips_approved: false,
+        tables: crate::part_state::part_res_count(pal, io)?,
+        fips_approved: crate::part_state::part_fips_approved(pal, io)?,
     };
 
     let resp = pal.dma_alloc_var(io, |buf| {
         super::encode_resp(
-            &super::success_hdr(hdr, DdiOp::GetDeviceInfo),
+            &super::success_hdr(pal, io, hdr, DdiOp::GetDeviceInfo)?,
             &resp_data,
             buf,
         )

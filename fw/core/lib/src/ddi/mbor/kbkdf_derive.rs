@@ -114,7 +114,7 @@ pub(crate) async fn kbkdf_counter_hmac_derive<'p, P: HsmPal>(
 
         pal.dma_alloc_var(io, |buf| {
             super::encode_resp(
-                &super::success_hdr_sess(hdr, DdiOp::KbkdfCounterHmacDerive, sess_id),
+                &super::success_hdr_sess(pal, io, hdr, DdiOp::KbkdfCounterHmacDerive, sess_id)?,
                 &DdiKbkdfCounterHmacDeriveResp {
                     key_id,
                     masked_key,

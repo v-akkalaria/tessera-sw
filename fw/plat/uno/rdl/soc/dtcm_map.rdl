@@ -63,6 +63,11 @@ reg core_run_status_t {
     field { sw = rw; hw = na; } ALIVE[31:0] = 0x0;
 };
 
+mem fips_approved_t {
+    desc = "Firmware-only approval for 65 functions, shared with Admin.";
+    mementries = 65;
+    memwidth = 8;
+};
 
 // ══════════════════════════════════════════════════════════════
 // Address Map
@@ -90,4 +95,5 @@ addrmap hsm_dtcm {
     // Crashdump + heartbeat
     crashdump_base_t  CRASHDUMP_BASE    @ 0x3F400;
     core_run_status_t CORE_RUN_STATUS   @ 0x3F800;
+    fips_approved_t   FIPS_APPROVED     @ 0x3F838;
 };

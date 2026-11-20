@@ -20,6 +20,10 @@ pub const CRASHDUMP_BASE_OFFSET: u32 = 0x3F400;
 pub const CRASHDUMP_BASE_COUNT: u32 = 1;
 pub const CRASHDUMP_BASE_STRIDE: u32 = 0x400;
 pub const CRASHDUMP_BASE_SIZE: u32 = 0x400;
+pub const FIPS_APPROVED_OFFSET: u32 = 0x3F838;
+pub const FIPS_APPROVED_COUNT: u32 = 1;
+pub const FIPS_APPROVED_STRIDE: u32 = 0x41;
+pub const FIPS_APPROVED_SIZE: u32 = 0x41;
 
 tock_registers::register_bitfields! [u32,
     /// 'Liveliness heartbeat. HSM writes 1 periodically; SP reads then zeroes. Zero on next poll = hung.'
@@ -38,7 +42,9 @@ pub mod regs {
             (0x3b400 => pub dev_id_cert_blob: [u8; 16384]),
             (0x3f400 => pub crashdump_base: [u8; 1024]),
             (0x3f800 => pub core_run_status: crate::RW<u32, super::CORE_RUN_STATUS::Register>),
-            (0x3f804 => @END),
+            (0x3f804 => _reserved2),
+            (0x3f838 => pub fips_approved: [u8; 65]),
+            (0x3f879 => @END),
         }
     }
 }

@@ -178,7 +178,7 @@ pub(crate) async fn attest_key<'p, P: HsmPal>(
     // report.
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr_sess(hdr, DdiOp::AttestKey, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::AttestKey, sess_id)?,
             buf,
         )?;
         let layout = DdiAttestKeyResp::reserve(&mut encoder, report_len)?;

@@ -29,7 +29,7 @@ pub(crate) async fn sha_digest<'p, P: HsmPal>(
     let digest_len = algo.digest_len();
 
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
-        let resp_hdr = super::success_hdr(hdr, DdiOp::ShaDigest);
+        let resp_hdr = super::success_hdr(pal, io, hdr, DdiOp::ShaDigest)?;
         let mut encoder = super::encode_resp_hdr(&resp_hdr, buf)?;
         let layout = DdiShaDigestResp::reserve(&mut encoder, digest_len)?;
         Ok((encoder.position(), layout))

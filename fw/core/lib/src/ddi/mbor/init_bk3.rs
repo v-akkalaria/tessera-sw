@@ -162,7 +162,7 @@ pub(super) async fn mask_bk3<'p, P: HsmPal>(
     // mask call below operates on the buffer materialized via
     // `from_layout`.
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
-        let resp_hdr = super::success_hdr(hdr, hdr.op);
+        let resp_hdr = super::success_hdr(pal, io, hdr, hdr.op)?;
         let mut encoder = super::encode_resp_hdr(&resp_hdr, buf)?;
         let layout = DdiInitBk3Resp::reserve(&mut encoder, masked_bk3_len, vm_launch_guid_len)?;
         Ok((encoder.position(), layout))

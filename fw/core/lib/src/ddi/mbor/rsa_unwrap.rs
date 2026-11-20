@@ -156,7 +156,7 @@ pub(crate) async fn rsa_unwrap<'p, P: HsmPal>(
             let key_id: u16 = key_id.into();
             pal.dma_alloc_var(io, |buf| {
                 super::encode_resp(
-                    &super::success_hdr_sess(hdr, DdiOp::RsaUnwrap, sess_id),
+                    &super::success_hdr_sess(pal, io, hdr, DdiOp::RsaUnwrap, sess_id)?,
                     &DdiRsaUnwrapResp {
                         key_id,
                         pub_key: None,
@@ -305,7 +305,7 @@ pub(crate) async fn rsa_unwrap<'p, P: HsmPal>(
     let kind = ddi_key_type(vault_kind)?;
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr_sess(hdr, DdiOp::RsaUnwrap, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::RsaUnwrap, sess_id)?,
             buf,
         )?;
         let layout = DdiRsaUnwrapResp::reserve(

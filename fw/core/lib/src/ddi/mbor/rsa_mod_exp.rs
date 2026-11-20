@@ -66,7 +66,7 @@ pub(crate) async fn rsa_mod_exp<'p, P: HsmPal>(
     // there is no separate scratch buffer or copy.
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr_sess(hdr, DdiOp::RsaModExp, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::RsaModExp, sess_id)?,
             buf,
         )?;
         let layout = DdiRsaModExpResp::reserve(&mut encoder, modulus_len)?;

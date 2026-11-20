@@ -42,7 +42,7 @@ pub(crate) fn get_sealed_bk3<'p, P: HsmPal>(
 
     let resp = pal.dma_alloc_var(io, |buf| {
         let mut encoder =
-            super::encode_resp_hdr(&super::success_hdr(hdr, DdiOp::GetSealedBk3), buf)?;
+            super::encode_resp_hdr(&super::success_hdr(pal, io, hdr, DdiOp::GetSealedBk3)?, buf)?;
         let frame = DdiGetSealedBk3Resp::frame(&mut encoder, sealed_len)?;
         let total = encoder.position();
         let bytes = crate::part_state::part_sealed_bk3(pal, io)?;

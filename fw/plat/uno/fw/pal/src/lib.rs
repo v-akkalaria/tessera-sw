@@ -44,6 +44,8 @@ mod crypto;
 #[allow(unsafe_code)]
 mod dev_id_cblob;
 #[allow(unsafe_code)]
+mod fips;
+#[allow(unsafe_code)]
 mod gdma;
 #[allow(unsafe_code)]
 mod gsram_alias;

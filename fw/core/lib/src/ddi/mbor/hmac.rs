@@ -57,7 +57,7 @@ pub(crate) async fn hmac<'p, P: HsmPal>(
 
     let resp = pal.dma_alloc_var(io, |buf| {
         super::encode_resp(
-            &super::success_hdr_sess(hdr, DdiOp::Hmac, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::Hmac, sess_id)?,
             &DdiHmacResp {
                 tag: &tag[..tag_len],
             },

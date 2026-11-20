@@ -42,7 +42,7 @@ pub(crate) async fn delete_key<'p, P: HsmPal>(
 
     let resp = pal.dma_alloc_var(io, |buf| {
         super::encode_resp(
-            &super::success_hdr_sess(hdr, DdiOp::DeleteKey, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::DeleteKey, sess_id)?,
             &DdiDeleteKeyResp {},
             buf,
         )

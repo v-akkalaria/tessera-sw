@@ -135,7 +135,7 @@ pub(crate) async fn change_pin<'p, P: HsmPal>(
 
     let resp = pal.dma_alloc_var(io, |buf| {
         super::encode_resp(
-            &super::success_hdr_sess(hdr, DdiOp::ChangePin, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::ChangePin, sess_id)?,
             &DdiChangePinResp {},
             buf,
         )

@@ -803,6 +803,14 @@ impl HsmPartPropId {
     /// flag is also reset PAL-internally on partition free / NSSR.
     pub const SD_INITIALIZED: HsmPartPropId = HsmPartPropId(0x0009);
 
+    /// Firmware-only approval, supplied by the measured boot state.
+    /// Read-only Bool; simulators default to false.
+    pub const FIRMWARE_FIPS_APPROVED: HsmPartPropId = HsmPartPropId(0x000A);
+
+    /// Effective MBOR approval: approved firmware and secure BK3 provisioning.
+    /// Read-only Bool, recomputed by the PAL from the current partition state.
+    pub const FIPS_APPROVED: HsmPartPropId = HsmPartPropId(0x000B);
+
     /// Volatile BK3 provisioning ID followed by PIN (16 + 16 bytes).
     /// Never exported or restored with the persistent partition store.
     pub const BK3_PROV_CREDENTIAL: HsmPartPropId = HsmPartPropId(0x0024);
@@ -961,9 +969,9 @@ impl HsmPartPropId {
         use HsmPartPropDefault::AbsentUntilSet as Abs;
         use HsmPartPropDefault::RequiredPresent as Req;
         use HsmPartPropKind::Bool;
-        use HsmPartPropKind::U8;
         use HsmPartPropKind::U16;
         use HsmPartPropKind::U32;
+        use HsmPartPropKind::U8;
 
         // Writable vault-ref props share the same shape (u16 HsmKeyId, RW, absent).
         const VAULT_REF_RW: HsmPartPropMeta = HsmPartPropMeta::scalar(U16, Rw, Abs, false);
@@ -978,6 +986,9 @@ impl HsmPartPropId {
             Self::PART_RES_COUNT => HsmPartPropMeta::scalar(U8, Ro, Req, false),
             Self::BK3_INITIALIZED => HsmPartPropMeta::scalar(Bool, Rw, Req, false),
             Self::SD_INITIALIZED => HsmPartPropMeta::scalar(Bool, Rw, Req, false),
+            Self::FIRMWARE_FIPS_APPROVED | Self::FIPS_APPROVED => {
+                HsmPartPropMeta::scalar(Bool, Ro, Req, false)
+            }
             Self::BK3_PROV_CREDENTIAL => HsmPartPropMeta::fixed(32, Rw, Abs, true),
 
             // ── Vault refs (HsmKeyId as u16) ──

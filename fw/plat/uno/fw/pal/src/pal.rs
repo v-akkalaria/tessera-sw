@@ -1351,6 +1351,7 @@ impl HsmPal for UnoHsmPal {
                 tsra_fw_uno_drivers_part_store::PartStore::rearm_unwrapping_key_required();
             }
         }
+        self.init_fips_approval().expect("initialize FIPS approval");
         boot_status::set(BootStatus::Done);
         info!("boot", "init: boot_status=Done published");
     }

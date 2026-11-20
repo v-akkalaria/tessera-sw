@@ -111,7 +111,7 @@ pub(crate) async fn aes_generate_key<'p, P: HsmPal>(
 
         pal.dma_alloc_var(io, |buf| {
             super::encode_resp(
-                &super::success_hdr_sess(hdr, DdiOp::AesGenerateKey, sess_id),
+                &super::success_hdr_sess(pal, io, hdr, DdiOp::AesGenerateKey, sess_id)?,
                 &DdiAesGenerateKeyResp {
                     key_id,
                     bulk_key_id,

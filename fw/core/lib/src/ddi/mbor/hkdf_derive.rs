@@ -133,7 +133,7 @@ pub(crate) async fn hkdf_derive<'p, P: HsmPal>(
 
         pal.dma_alloc_var(io, |buf| {
             super::encode_resp(
-                &super::success_hdr_sess(hdr, DdiOp::HkdfDerive, sess_id),
+                &super::success_hdr_sess(pal, io, hdr, DdiOp::HkdfDerive, sess_id)?,
                 &DdiHkdfDeriveResp {
                     key_id,
                     masked_key,

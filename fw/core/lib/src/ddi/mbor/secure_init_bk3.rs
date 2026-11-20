@@ -55,7 +55,7 @@ pub(crate) async fn set_init_bk3_pin<'p, P: HsmPal>(
     let (aes_key, hmac_key) = keys.split_at(32);
     let resp = pal.dma_alloc_var(io, |buf| {
         encode_resp(
-            &success_hdr(hdr, DdiOp::SetInitBk3Pin),
+            &success_hdr(pal, io, hdr, DdiOp::SetInitBk3Pin)?,
             &DdiSetInitBk3PinResp {},
             buf,
         )

@@ -11,6 +11,7 @@ doctest = false
 test = false
 
 [dependencies]
+cortex-m = { workspace = true }
 tsra_fw_core_crypto_key_derive = { workspace = true }
 tsra_fw_core_crypto_key_masking = { optional = true, workspace = true }
 tsra_fw_core_crypto_x509_builder = { workspace = true }

@@ -251,14 +251,51 @@ pub(crate) fn encode_resp_hdr<'a>(
 }
 
 /// Build a success [`DdiRespHdr`] echoing the request's `rev` field.
-pub(crate) fn success_hdr(req: &DdiReqHdr, op: DdiOp) -> DdiRespHdr {
-    DdiRespHdr {
+pub(crate) fn success_hdr<P: HsmPal>(
+    pal: &P,
+    io: &P::Io,
+    req: &DdiReqHdr,
+    op: DdiOp,
+) -> HsmResult<DdiRespHdr> {
+    let fips_approved = match op {
+        DdiOp::GetApiRev | DdiOp::GetDeviceInfo => true,
+        DdiOp::GetEstablishCredEncryptionKey | DdiOp::SetInitBk3Pin | DdiOp::SecureInitBk3 => {
+            crate::part_state::part_firmware_fips_approved(pal, io)?
+        }
+        DdiOp::GetCertChainInfo
+        | DdiOp::GetCertificate
+        | DdiOp::GetSessionEncryptionKey
+        | DdiOp::GetUnwrappingKey
+        | DdiOp::GetSealedBk3
+        | DdiOp::SetSealedBk3
+        | DdiOp::EstablishCredential
+        | DdiOp::ChangePin
+        | DdiOp::OpenSession
+        | DdiOp::CloseSession
+        | DdiOp::ReopenSession
+        | DdiOp::DeleteKey
+        | DdiOp::AesGenerateKey
+        | DdiOp::AesEncryptDecrypt
+        | DdiOp::EccGenerateKeyPair
+        | DdiOp::EccSign
+        | DdiOp::EcdhKeyExchange
+        | DdiOp::HkdfDerive
+        | DdiOp::KbkdfCounterHmacDerive
+        | DdiOp::Hmac
+        | DdiOp::RsaModExp
+        | DdiOp::RsaUnwrap
+        | DdiOp::UnmaskKey
+        | DdiOp::AttestKey => crate::part_state::part_fips_approved(pal, io)?,
+        // Legacy provisioning, raw digest and test services stay unapproved.
+        _ => false,
+    };
+    Ok(DdiRespHdr {
         rev: req.rev,
         op,
         sess_id: None,
         status: 0, // DDI Success
-        fips_approved: false,
-    }
+        fips_approved,
+    })
 }
 
 /// Build a success [`DdiRespHdr`] for a session-bearing command.
@@ -266,14 +303,16 @@ pub(crate) fn success_hdr(req: &DdiReqHdr, op: DdiOp) -> DdiRespHdr {
 /// Use this for handlers whose response header must carry the session
 /// id the command opened or closed (e.g. `OpenSession` returns the
 /// freshly-allocated id; `CloseSession` echoes the closed id back).
-pub(crate) fn success_hdr_sess(req: &DdiReqHdr, op: DdiOp, sess_id: u16) -> DdiRespHdr {
-    DdiRespHdr {
-        rev: req.rev,
-        op,
-        sess_id: Some(sess_id),
-        status: 0, // DDI Success
-        fips_approved: false,
-    }
+pub(crate) fn success_hdr_sess<P: HsmPal>(
+    pal: &P,
+    io: &P::Io,
+    req: &DdiReqHdr,
+    op: DdiOp,
+    sess_id: u16,
+) -> HsmResult<DdiRespHdr> {
+    let mut hdr = success_hdr(pal, io, req, op)?;
+    hdr.sess_id = Some(sess_id);
+    Ok(hdr)
 }
 
 /// Encode a DDI error response into `smem`.

@@ -76,7 +76,7 @@ pub(crate) async fn get_unwrapping_key<'p, P: HsmPal>(
 
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
         let mut encoder = super::encode_resp_hdr(
-            &super::success_hdr_sess(hdr, DdiOp::GetUnwrappingKey, sess_id),
+            &super::success_hdr_sess(pal, io, hdr, DdiOp::GetUnwrappingKey, sess_id)?,
             buf,
         )?;
         let layout = DdiGetUnwrappingKeyResp::reserve(

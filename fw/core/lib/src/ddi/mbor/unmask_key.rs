@@ -252,7 +252,7 @@ pub(crate) async fn unmask_key<'p, P: HsmPal>(
 
         let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
             let mut encoder = super::encode_resp_hdr(
-                &super::success_hdr_sess(hdr, DdiOp::UnmaskKey, sess_id),
+                &super::success_hdr_sess(pal, io, hdr, DdiOp::UnmaskKey, sess_id)?,
                 buf,
             )?;
             let layout = DdiUnmaskKeyResp::reserve(
