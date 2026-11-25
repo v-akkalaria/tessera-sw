@@ -12,7 +12,7 @@
 //! The **round-trip** test uses a self-backup (sender == receiver): a first
 //! device finalizes and `CreateSD`s (producing the `pok_remote_backup` /
 //! `sd_mk_backup` this command consumes, plus the `local_mk_backup`), then a
-//! second device (factory-reset, same machine seed) restores `PartLocalMK`
+//! second device (reset by NSSR, same machine seed) restores `PartLocalMK`
 //! via `PartFinal` — so it can unmask the captured sealing key — and
 //! restores the security domain from the remote backup.
 //!
@@ -441,12 +441,13 @@ fn sd_restore_remote_backup_rejects_max_session_id() {
 
     let req = restore_remote_req(u16::MAX, &backup);
 
-    // Unknown sessions may be rejected by firmware or the socket ownership gate.
+    // The handle already owns a session, so the driver or socket ownership
+    // gate rejects the unowned u16::MAX before it reaches firmware.
     let err = ctx
         .tbor_oob(&req, &backup.evidence.oob())
         .expect_err("u16::MAX session ID must be rejected");
 
-    ctx.assert_unknown_session_rejects(&err, TborStatus::SessionNotFound);
+    ctx.assert_unknown_session_rejects(&err, TborStatus::FileHandleSessionIdDoesNotMatch);
     assert_part_state(&ctx, PART_STATE_INITIALIZED, false);
     assert_part_state(&ctx, PART_STATE_INITIALIZED, false);
 }

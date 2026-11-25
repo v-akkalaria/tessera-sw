@@ -45,7 +45,7 @@ pub(crate) async fn handle<P: HsmPal>(
     };
 
     let resp = cmd_buf.encode_response(|buf| {
-        let frame = TborGetCertChainInfoResp::encode(buf, 0, fips_approved)?
+        let frame = TborGetCertChainInfoResp::encode_for_request(buf, 0, fips_approved)?
             .num_certs(info.count)?
             .thumbprint(&info.thumbprint)?
             .finish();

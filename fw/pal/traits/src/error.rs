@@ -243,11 +243,6 @@ pub enum HsmError {
     PartitionNotProvisioned = 0x087000D5,
     Bk3AlreadyInitialized = 0x087000D6,
     SealedBk3AlreadySet = 0x087000D7,
-    Bk3PinAlreadySet = 0x087000E8,
-    Bk3PinNotSet = 0x087000E9,
-    Bk3PinTagMismatch = 0x087000EA,
-    Bk3TransportTagMismatch = 0x087000EB,
-    Bk3NotSecurelyProvisioned = 0x087000EC,
     PartitionIdKeyGenerationPctFailed = 0x087000D8,
 
     // ── AES Key Wrap errors ────────────────────────────────────────
@@ -273,7 +268,7 @@ pub enum HsmError {
     /// partition PSK is still the well-known compiled-in default.
     /// The only in-session commands permitted in this state are
     /// session tear-down (`CloseSession`) and the PSK rotation
-    /// itself (`ChangePsk`); rotate the PSK once and retry.
+    /// itself (`ChangePsk`); rotate, close, and reopen with the new PSK.
     DefaultPskMustRotate = 0x087000E6,
 
     /// `OpenSessionInit` rejected the caller-supplied `suite_id`
@@ -281,11 +276,22 @@ pub enum HsmError {
     /// See [`HsmSessionSuite`] for the registered values.
     UnsupportedSessionSuite = 0x087000E7,
 
+    // ── Secure BK3 provisioning ────────────────────────────────────
+    Bk3PinAlreadySet = 0x087000E8,
+    Bk3PinNotSet = 0x087000E9,
+    Bk3PinTagMismatch = 0x087000EA,
+    Bk3TransportTagMismatch = 0x087000EB,
+    Bk3NotSecurelyProvisioned = 0x087000EC,
+
     /// An ML-DSA key pair failed its sign/verify PCT.
     PctValidationMlDsaGenKeyFailed = 0x087000ED,
 
     /// An ML-KEM key pair failed its encapsulate/decapsulate PCT.
     PctValidationMlKemGenKeyFailed = 0x087000EE,
+
+    /// The CU session authenticated with the public default PSK, which
+    /// has since been rotated. Close and reopen with the new credential.
+    DefaultPskChanged = 0x087000EF,
 
     /// X.509 DER parsing failed (malformed structure, bad tag/length,
     /// or unsupported field encoding).
@@ -467,6 +473,9 @@ pub enum HsmError {
     /// valid.  Mirrors [`EccVerifyFailed`](Self::EccVerifyFailed).
     MlDsaVerifyFailed = 0x0870010D,
 
+    /// An RSA signature did not verify.
+    RsaVerifyFailed = 0x0870010E,
+
     /// A cryptographic algorithm self-test (CAST) produced output that
     /// did not match its known-answer vector.
     SelfTestKatMismatch = 0x08700110,
@@ -480,6 +489,8 @@ pub enum HsmError {
     /// A protected IO transport failed: the request failed authentication,
     /// or its session has no transport keys.
     SessionTransportError = 0x08700113,
+    /// This logical session already committed its one permitted PSK change.
+    PskChangeAlreadyUsed = 0x08700114,
 
     // Firmware-internal diagnostic codes logged by the CPU fault and panic
     // exception handlers (`tsra_fw_uno_fault`). These are not DDI protocol

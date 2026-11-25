@@ -15,12 +15,12 @@
 //! [`HsmPartState::Unallocated`]; a non-zero `SetResource` allocates the
 //! partition and a `PfnEnable` IPC enables it.
 
-use tsra_fw_hsm_pal_traits::HsmAlloc;
 use tsra_fw_hsm_pal_traits::HsmDmaBuf;
 use tsra_fw_hsm_pal_traits::HsmEcc;
 use tsra_fw_hsm_pal_traits::HsmEccCurve;
 use tsra_fw_hsm_pal_traits::HsmEccPct;
 use tsra_fw_hsm_pal_traits::HsmError;
+use tsra_fw_hsm_pal_traits::HsmFipsProvStatus;
 use tsra_fw_hsm_pal_traits::HsmKeyId;
 use tsra_fw_hsm_pal_traits::HsmPartPropId;
 use tsra_fw_hsm_pal_traits::HsmPartState;
@@ -31,8 +31,6 @@ use tsra_fw_hsm_pal_traits::HsmSessId;
 use tsra_fw_hsm_pal_traits::HsmVault;
 use tsra_fw_hsm_pal_traits::HsmVaultKeyAttrs;
 use tsra_fw_hsm_pal_traits::HsmVaultKeyKind;
-use tsra_fw_hsm_pal_traits::HsmVaultPct;
-use tsra_fw_hsm_pal_traits::MASKED_BK_BOOT_LEN;
 use tsra_fw_uno_drivers_part_store::HsmPartId;
 use tsra_fw_uno_drivers_part_store::PartResetKind;
 use tsra_fw_uno_drivers_part_store::PartStore;
@@ -565,7 +563,8 @@ impl UnoHsmPal {
     ///
     /// - **VF / re-enable** (`Allocated | Disabled → Enabled`): the
     ///   establish-credential and session-encryption ECC P-384 key pairs are
-    ///   generated here with a fresh nonce and default PSKs are installed,
+    ///   generated here with a fresh nonce (and the identity, if a failed
+    ///   [`part_migrate`] left none) and default PSKs are installed,
     ///   then host IO is accepted. Each role must rotate its PSK again.
     /// - **PF enable-before-SetResource** (`Unallocated → Enabled`, only when
     ///   `is_pf`): `res_mask` is not yet assigned, so the enable-time keys
@@ -585,6 +584,7 @@ impl UnoHsmPal {
     /// Returns [`HsmError::InvalidArg`] for an illegal transition.
     ///
     /// [`part_alloc`]: Self::part_alloc
+    /// [`part_migrate`]: Self::part_migrate
     pub(crate) async fn part_enable(&self, pid: HsmPartId, is_pf: bool) -> HsmResult<()> {
         let part = PartStore::partition(pid)?;
         if is_pf && part.state()? == HsmPartState::Faulted {
@@ -592,6 +592,11 @@ impl UnoHsmPal {
         }
         match part.state()? {
             HsmPartState::Allocated | HsmPartState::Disabled => {
+                // A failed NSSR migration can leave the partition without its
+                // identity.
+                if part.id_key_id().is_none() {
+                    self.provision_identity(pid).await?;
+                }
                 self.provision_enabled_keys(pid).await?;
                 part.bake_default_psks();
                 part.set_state(HsmPartState::Enabled);
@@ -653,13 +658,15 @@ impl UnoHsmPal {
     /// reference does `vault().clear()` / `KeyStore::nuke()`) so no prior
     /// tenant key survives, then clears only the per-tenant persistent state
     /// (credential, enable-time/provisioning key handles, nonce, session table,
-    /// BK3 session key, PIN policy) while PRESERVING the provisioning material
-    /// (sealed BK3 + incarnation flag, PTA public key, policy hash, PSKs, VM launch GUID, and
-    /// `Masked_BK_BOOT`). Because the vault wipe also removes the identity
-    /// private key, a fresh partition identity (keypair + id blob) is
-    /// regenerated — matching the *std* reference firmware, whose NSSR/erase
-    /// always provisions a fresh identity. Finally refreshes the nonce and regenerates
-    /// the establish-credential and session-encryption keys.
+    /// BK3 session key, PIN policy) and `PartInit`'s provisioning (policy hash
+    /// and PTA public key), while PRESERVING the migrated state (sealed BK3 +
+    /// incarnation flag, VM launch GUID, and `Masked_BK_BOOT`). The PSKs are
+    /// not migrated: they return to their defaults, and every slot's
+    /// PSK-change-consumed bit is cleared, so each role rotates its PSK again.
+    /// Because the vault wipe also removes the identity private key, a fresh
+    /// partition identity (keypair + id blob) is regenerated, as a migration
+    /// target presents its own identity. Finally refreshes the nonce and
+    /// regenerates the establish-credential and session-encryption keys.
     ///
     /// Established session slots are marked for renegotiation
     /// (`SessionTable::mark_all_needs_renego`), mirroring `state.migrate()`'s
@@ -667,9 +674,10 @@ impl UnoHsmPal {
     /// `SessionNeedsRenegotiation` until the host reopens the session, and
     /// `CloseSession` still succeeds. Pending handshakes are released.
     ///
-    /// Provisioning survives NSSR with a freshly regenerated identity, and
-    /// credentials can be re-established. A full [`part_disable`] additionally
-    /// tears down the provisioning material. This does not implement IDFU
+    /// The partition is provisioned again (`PartInit` / `PartFinal`) after
+    /// NSSR, under a freshly regenerated identity, and credentials can be
+    /// re-established. A full [`part_disable`] additionally tears down the
+    /// migrated state. This does not implement IDFU
     /// queue quiesce/resume.
     ///
     /// # Accepted states
@@ -685,7 +693,9 @@ impl UnoHsmPal {
     ///   per-tenant state and identity fields are cleared; provisioning is
     ///   left to the later `SetResource` → [`part_alloc`] path.
     /// - Anything else — full wipe, then re-provision and leave the
-    ///   partition `Enabled` and re-provisionable.
+    ///   partition `Enabled` and re-provisionable. The partition is
+    ///   `Disabled` while it is rebuilt, so a failure leaves it not serving;
+    ///   a later NSSR retries the migration, and an enable restores it too.
     ///
     /// Note the last case leaves a previously-`Disabled` partition
     /// `Enabled`, so an NSSR is also an implicit re-enable.
@@ -717,6 +727,10 @@ impl UnoHsmPal {
             return Ok(());
         }
 
+        // Not serving while the partition is rebuilt: a failure below leaves
+        // it `Disabled` rather than in its earlier state over cleared tenant
+        // state.
+        part.set_state(HsmPartState::Disabled);
         // Wipe every vault key (app + session + internal) so no prior
         // tenant key material survives the reset, and release the partition's
         // fast-path engine bulk-key slots. Runs inside a `with_admin_io`
@@ -814,80 +828,12 @@ impl UnoHsmPal {
 }
 
 impl HsmPartitionManager for UnoHsmPal {
-    fn part_commit_bk3(
-        &self,
-        io: &UnoHsmIo,
-        secure: bool,
-        masked_boot: Option<&HsmDmaBuf>,
-    ) -> HsmResult<()> {
-        let part = PartStore::partition(io.pid())?;
-        if part.bk3_initialized() {
-            return Err(HsmError::Bk3AlreadyInitialized);
-        }
-        if let Some(boot) = masked_boot {
-            if boot.is_empty() || boot.len() > MASKED_BK_BOOT_LEN {
-                return Err(HsmError::InvalidArg);
-            }
-        } else if part.masked_bk_boot().is_empty() {
-            return Err(HsmError::InvalidArg);
-        }
-        if let Some(boot) = masked_boot {
-            part.set_masked_bk_boot(boot)?;
-        }
-        part.set_bk3_initialized(true);
-        part.set_fips_status(if secure { 1 } else { 2 });
-        self.set_fp_fips_approved(io.pid(), secure && self.firmware_fips_approved(io.pid()));
-        Ok(())
-    }
-
-    async fn part_ensure_establish_cred_key(&self, io: &UnoHsmIo) -> HsmResult<()> {
-        let part = PartStore::partition(io.pid())?;
-        if part.ec_key_id().is_some() {
-            return Ok(());
-        }
-        self.alloc_scoped_async(io, async |alloc| {
-            let priv_key = alloc.dma_alloc(P384_PRIV_LEN)?;
-            let pub_key = alloc.dma_alloc(ID_PUB_KEY_LEN)?;
-            let (priv_len, pub_len) = self
-                .ecc_gen_keypair(
-                    io,
-                    HsmEccCurve::P384,
-                    HsmEccPct::KeyAgreement,
-                    Some((priv_key, pub_key)),
-                )
-                .await?;
-            if priv_len != P384_PRIV_LEN || pub_len != ID_PUB_KEY_LEN {
-                return Err(HsmError::EccInvalidKeyLength);
-            }
-            let attrs = HsmVaultKeyAttrs::new()
-                .with_internal(true)
-                .with_local(true)
-                .with_derive(true);
-            let blob = alloc.dma_alloc(ENABLE_KEY_LEN)?;
-            blob[..ID_PUB_KEY_LEN].copy_from_slice(pub_key);
-            blob[ID_PUB_KEY_LEN..].copy_from_slice(priv_key);
-            let kid = self
-                .vault_key_create(
-                    io,
-                    blob,
-                    HsmVaultKeyKind::EstablishCred,
-                    None,
-                    attrs,
-                    HsmVaultPct::None,
-                )
-                .await?;
-            part.set_ec_pub_key(pub_key)?;
-            part.set_ec_key_id(Some(kid));
-            Ok(())
-        })
-        .await
-    }
-
     fn part_prop_get_u8(&self, io: &UnoHsmIo, id: HsmPartPropId) -> HsmResult<u8> {
         let part = PartStore::partition(io.pid())?;
         match id {
             HsmPartPropId::PART_STATE => Ok(part.state()? as u8),
             HsmPartPropId::PART_RES_COUNT => Ok(part.res_mask().count_ones() as u8),
+            HsmPartPropId::BK3_PROVISIONING_STATUS => Ok(part.fips_status() as u8),
             _ => Err(HsmError::UnsupportedCmd),
         }
     }
@@ -902,6 +848,23 @@ impl HsmPartitionManager for UnoHsmPal {
                 // prior states through this raw path.
                 let target = HsmPartState::from_u8(value).ok_or(HsmError::InvalidArg)?;
                 part.set_state(target);
+                Ok(())
+            }
+            // Classification only; reset happens PAL-internally.
+            HsmPartPropId::BK3_PROVISIONING_STATUS => {
+                let status = match HsmFipsProvStatus::from_u8(value) {
+                    Some(
+                        status @ (HsmFipsProvStatus::SecureApproved
+                        | HsmFipsProvStatus::LegacyUnapproved),
+                    ) => status,
+                    _ => return Err(HsmError::InvalidArg),
+                };
+                part.set_fips_status(status);
+                self.set_fp_fips_approved(
+                    io.pid(),
+                    status == HsmFipsProvStatus::SecureApproved
+                        && self.firmware_fips_approved(io.pid()),
+                );
                 Ok(())
             }
             // RES_COUNT is read-only; it is derived from the resource mask.
@@ -973,9 +936,8 @@ impl HsmPartitionManager for UnoHsmPal {
         let part = PartStore::partition(io.pid())?;
         match id {
             HsmPartPropId::FIRMWARE_FIPS_APPROVED => Ok(self.firmware_fips_approved(io.pid())),
-            HsmPartPropId::FIPS_APPROVED => {
-                Ok(self.firmware_fips_approved(io.pid()) && part.fips_status() == 1)
-            }
+            HsmPartPropId::FIPS_APPROVED => Ok(self.firmware_fips_approved(io.pid())
+                && part.fips_status() == HsmFipsProvStatus::SecureApproved),
             HsmPartPropId::BK3_INITIALIZED => Ok(part.bk3_initialized()),
             HsmPartPropId::SD_INITIALIZED => Ok(part.sd_initialized()),
             _ => Err(HsmError::UnsupportedCmd),
@@ -1126,6 +1088,7 @@ impl HsmPartitionManager for UnoHsmPal {
                 Ok(())
             }
             HsmPartPropId::NONCE => p.set_nonce(data),
+            HsmPartPropId::ESTABLISH_CRED_ECC_PUB_KEY => p.set_ec_pub_key(data),
             HsmPartPropId::PSK_CO => p.set_psk_co(data),
             HsmPartPropId::PSK_CU => p.set_psk_cu(data),
             HsmPartPropId::CREDENTIAL => p.set_credential(data),

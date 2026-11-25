@@ -60,6 +60,7 @@ use zeroize::Zeroizing;
 
 use super::*;
 use crate::cert::MAX_CERT_DER_LEN;
+use crate::drivers::ecc::EccForm;
 use crate::drivers::session::SessionTable;
 use crate::drivers::vault::KeyVault;
 use crate::StdHsmPal;
@@ -228,34 +229,37 @@ pub(crate) struct PartitionEntry {
     /// `Masked_BK_BOOT` — `BK_BOOT` enveloped with a platform-derived
     /// `BKx` masking key.
     ///
-    /// Generated at allocation, or recreated by BK3 initialization after
-    /// ClearBk3. The raw `BK_BOOT` is recovered on demand by unmasking this
-    /// blob. Preserved across disable/enable; cleared on free or ClearBk3.
+    /// Generated at allocation. The raw `BK_BOOT` is recovered on demand by
+    /// unmasking this blob. Preserved across disable/enable and NSSR; cleared
+    /// on free.
     masked_bk_boot: [u8; MASKED_BK_BOOT_LEN],
 
     /// Length of valid data in `masked_bk_boot` (0 = not yet
     /// populated).
     ///
-    /// Reset to 0 on free or ClearBk3, not on NSSR.
+    /// Reset to 0 on free, not on NSSR.
     masked_bk_boot_len: u32,
 
     /// VM launch GUID, set during partition enable.
     ///
     /// On the std PAL this is a fixed constant
     /// ([`STD_VM_LAUNCH_GUID`]); on real hardware it is sourced from
-    /// the platform. Preserved across NSSR and zeroed on free.
+    /// the platform. Preserved across NSSR; zeroed on disable and free.
     vm_launch_guid: [u8; VM_LAUNCH_GUID_LEN],
 
     /// BK3 initialization state for the current partition incarnation.
     ///
-    /// Set by `part_commit_bk3` and preserved across disable/enable.
-    /// Cleared on free or ClearBk3; authoritative one-shot gate for init.
+    /// Set through `BK3_INITIALIZED` and preserved across NSSR. Cleared on
+    /// disable or free; authoritative one-shot gate for init.
     bk3_initialized: bool,
 
     /// Volatile secure-BK3 provisioning ID/PIN; never a login credential.
     bk3_prov_credential: [u8; 32],
     bk3_prov_credential_set: bool,
-    fips_provisioning_status: u8,
+
+    /// BK3 provisioning classification.  Preserved across NSSR; reset on
+    /// disable or free.
+    fips_provisioning_status: HsmFipsProvStatus,
     /// Simulated firmware status, false outside explicit unit-test setup.
     firmware_fips_approved: bool,
 
@@ -285,6 +289,12 @@ pub(crate) struct PartitionEntry {
 
     /// Vault key ID of the partition unwrapping key.
     unwrapping_key_id: Option<HsmKeyId>,
+
+    /// The unwrapping key's private material, standing in for the slot the
+    /// SP publishes it in on hardware: generated once per allocation and
+    /// kept across disable and NSSR, which wipe the vault, so the partition
+    /// re-imports the same key.  Zeroized when dropped, on free.
+    unwrapping_key_bk: Option<Zeroizing<Vec<u8>>>,
 
     /// Crypto Officer PSK.  `None` while the well-known default
     /// applies; set to `Some` once `part_psk_set(psk_id=0, ..)` is
@@ -345,7 +355,7 @@ impl Default for PartitionEntry {
             bk3_initialized: false,
             bk3_prov_credential: [0u8; 32],
             bk3_prov_credential_set: false,
-            fips_provisioning_status: 0,
+            fips_provisioning_status: HsmFipsProvStatus::NotApproved,
             firmware_fips_approved: false,
             sd_initialized: false,
             credential: [0u8; 32],
@@ -354,6 +364,7 @@ impl Default for PartitionEntry {
             bk3_session_set: false,
             mk_key_id: None,
             unwrapping_key_id: None,
+            unwrapping_key_bk: None,
             psk_co: None,
             psk_cu: None,
             pta_key_id: None,
@@ -442,6 +453,13 @@ pub enum PartCommand {
         reply: tokio::sync::oneshot::Sender<HsmResult<()>>,
     },
 
+    /// Migrate a partition in place (NSSR); see
+    /// [`StdHsmPal::part_migrate_internal`].
+    Migrate {
+        pid: u8,
+        reply: tokio::sync::oneshot::Sender<HsmResult<()>>,
+    },
+
     /// Disable a partition: clear internal keys, nonce, vault, sessions.
     /// Transitions `Enabled → Disabled`.
     Disable {
@@ -455,71 +473,6 @@ pub enum PartCommand {
 // ---------------------------------------------------------------------------
 
 impl HsmPartitionManager for StdHsmPal {
-    fn part_commit_bk3(
-        &self,
-        io: &StdHsmIo,
-        secure: bool,
-        masked_boot: Option<&HsmDmaBuf>,
-    ) -> HsmResult<()> {
-        let entry = self
-            .table_mut()
-            .entries
-            .get_mut(usize::from(u8::from(io.pid())))
-            .ok_or(HsmError::InvalidArg)?;
-        if entry.bk3_initialized {
-            return Err(HsmError::Bk3AlreadyInitialized);
-        }
-        if let Some(boot) = masked_boot {
-            if boot.is_empty() || boot.len() > entry.masked_bk_boot.len() {
-                return Err(HsmError::InvalidArg);
-            }
-        } else if entry.masked_bk_boot_len == 0 {
-            return Err(HsmError::InvalidArg);
-        }
-        if let Some(boot) = masked_boot {
-            entry.masked_bk_boot.fill(0);
-            entry.masked_bk_boot[..boot.len()].copy_from_slice(boot);
-            entry.masked_bk_boot_len = boot.len() as u32;
-        }
-        entry.bk3_initialized = true;
-        entry.fips_provisioning_status = if secure { 1 } else { 2 };
-        Ok(())
-    }
-
-    async fn part_ensure_establish_cred_key(&self, io: &StdHsmIo) -> HsmResult<()> {
-        let pid = u8::from(io.pid());
-        let idx = pid as usize;
-        if self
-            .table()
-            .entries
-            .get(idx)
-            .ok_or(HsmError::InvalidArg)?
-            .establish_cred_key_id
-            .is_some()
-        {
-            return Ok(());
-        }
-        let mut pub_key = [0u8; P384_PUB_KEY_LEN];
-        let attrs = HsmVaultKeyAttrs::new()
-            .with_internal(true)
-            .with_local(true)
-            .with_derive(true);
-        let kid = self
-            .create_internal_ecc384_key(
-                pid,
-                HsmVaultKeyKind::EstablishCred,
-                attrs,
-                HsmEccPct::KeyAgreement,
-                StdHsmPal::BYTE_ORDER,
-                &mut pub_key,
-            )
-            .await?;
-        let entry = &mut self.table_mut().entries[idx];
-        entry.establish_cred_pub_key = pub_key;
-        entry.establish_cred_key_id = Some(kid);
-        Ok(())
-    }
-
     // ─── Property API ──────────────────────────────────────────────────
     //
     // Forwarding shims to the inherent `prop_*` implementations on
@@ -681,43 +634,45 @@ impl StdHsmPal {
     /// Only the private key is persisted (as HSM byte format — raw
     /// components, the std PAL's vault representation; real firmware stores
     /// its own raw key material); the public key is derived from it on
-    /// demand (matching the reference firmware).
+    /// demand (matching the reference firmware).  The key is generated once
+    /// per allocation and kept in `unwrapping_key_bk`, as the SP keeps the
+    /// key it publishes, so a vault wiped by disable or NSSR re-imports it.
     fn provision_unwrapping_key(&self, pid: HsmPartId) -> HsmResult<()> {
-        if self.active_part(pid)?.unwrapping_key_id.is_some() {
+        let entry = self.active_part(pid)?;
+        if entry.unwrapping_key_id.is_some() {
             return Ok(());
         }
 
-        let pk = RsaPrivateKey::generate(256).map_err(|_| HsmError::RsaGenerateError)?;
-        let priv_len = pk.hsm_bytes_len();
-        let mut priv_buf = vec![0u8; priv_len];
+        let priv_buf = match entry.unwrapping_key_bk.clone() {
+            Some(published) => published,
+            None => {
+                let pk = RsaPrivateKey::generate(256).map_err(|_| HsmError::RsaGenerateError)?;
+                let mut buf = Zeroizing::new(vec![0u8; pk.hsm_bytes_len()]);
+                pk.to_hsm_bytes(&mut buf[..])
+                    .map_err(|_| HsmError::RsaToDerError)?;
+                buf
+            }
+        };
+        let stored =
+            RsaPrivateKey::from_hsm_bytes(&priv_buf[..]).map_err(|_| HsmError::InvalidArg)?;
+        let passed = crate::drivers::rsa::unwrapping_key_pct(&stored)?;
+        #[cfg(test)]
+        let passed = passed && !self.rsa_pct_fail.get();
+        if !passed {
+            return Err(HsmError::PctValidationUnwrappingKeyFailed);
+        }
+
         let attrs = HsmVaultKeyAttrs::new()
             .with_internal(true)
             .with_local(true)
             .with_unwrap(true);
-        let result = (|| {
-            pk.to_hsm_bytes(&mut priv_buf[..priv_len])
-                .map_err(|_| HsmError::RsaToDerError)?;
-            let stored =
-                RsaPrivateKey::from_hsm_bytes(&priv_buf).map_err(|_| HsmError::InvalidArg)?;
-            let passed = crate::drivers::rsa::unwrapping_key_pct(&stored)?;
-            #[cfg(test)]
-            let passed = passed && !self.rsa_pct_fail.get();
-            if !passed {
-                return Err(HsmError::PctValidationUnwrappingKeyFailed);
-            }
-
-            let entry = self.active_part_mut(pid)?;
-            let kid = entry.vault.create(
-                &priv_buf[..priv_len],
-                HsmVaultKeyKind::Rsa2kPrivate,
-                None,
-                attrs,
-            )?;
-            entry.unwrapping_key_id = Some(kid);
-            Ok(())
-        })();
-        priv_buf.fill(0);
-        result
+        let entry = self.active_part_mut(pid)?;
+        let kid = entry
+            .vault
+            .create(&priv_buf[..], HsmVaultKeyKind::Rsa2kPrivate, None, attrs)?;
+        entry.unwrapping_key_id = Some(kid);
+        entry.unwrapping_key_bk.get_or_insert(priv_buf);
+        Ok(())
     }
 
     /// Borrow a partition that is actively serving host traffic.
@@ -801,7 +756,7 @@ impl StdHsmPal {
                 HsmVaultKeyKind::Ecc384Private,
                 id_attrs,
                 HsmEccPct::SignVerify,
-                HsmByteOrder::Be,
+                EccForm::BE,
                 &mut id_pub,
             )
             .await;
@@ -878,7 +833,10 @@ impl StdHsmPal {
 
     /// Enable a partition: create internal ECC-384 key pairs and nonce.
     ///
-    /// Transitions `Allocated | Disabled → Enabled`.
+    /// Transitions `Allocated | Disabled → Enabled`. BK3's one-shot
+    /// initialization is left as it is, as on the Uno PAL: a fresh or
+    /// disabled partition has it unset, and a failed migration keeps it with
+    /// the sealed BK3.
     pub async fn part_enable_internal(&self, pid: u8) -> HsmResult<()> {
         let table = self.table_mut();
         let idx = pid as usize;
@@ -889,7 +847,22 @@ impl StdHsmPal {
         if state != HsmPartState::Allocated && state != HsmPartState::Disabled {
             return Err(HsmError::InvalidArg);
         }
+        self.provision_enabled_keys(pid).await?;
 
+        let entry = &mut self.table_mut().entries[idx];
+        entry.vm_launch_guid = STD_VM_LAUNCH_GUID;
+        entry.sd_initialized = false;
+
+        entry.state = HsmPartState::Enabled;
+        Ok(())
+    }
+
+    /// Generate partition `pid`'s enable-time key material: its identity
+    /// key, if a reset wiped it, the establish-credential and
+    /// session-encryption ECC-384 key pairs, and a fresh nonce.
+    async fn provision_enabled_keys(&self, pid: u8) -> HsmResult<()> {
+        let table = self.table_mut();
+        let idx = pid as usize;
         let attrs = HsmVaultKeyAttrs::new()
             .with_internal(true)
             .with_local(true)
@@ -912,7 +885,7 @@ impl StdHsmPal {
                     HsmVaultKeyKind::Ecc384Private,
                     id_attrs,
                     HsmEccPct::SignVerify,
-                    HsmByteOrder::Be,
+                    EccForm::BE,
                     &mut id_pub,
                 )
                 .await?;
@@ -933,7 +906,7 @@ impl StdHsmPal {
                 HsmVaultKeyKind::EstablishCred,
                 attrs,
                 HsmEccPct::KeyAgreement,
-                StdHsmPal::BYTE_ORDER,
+                EccForm::of::<StdHsmPal>(),
                 &mut ec_pub,
             )
             .await?;
@@ -952,7 +925,7 @@ impl StdHsmPal {
                 HsmVaultKeyKind::SessionEncryption,
                 attrs,
                 HsmEccPct::KeyAgreement,
-                StdHsmPal::BYTE_ORDER,
+                EccForm::of::<StdHsmPal>(),
                 &mut se_pub,
             )
             .await;
@@ -975,25 +948,62 @@ impl StdHsmPal {
         // Generate 32-byte random nonce.
         if Rng::rand_bytes(&mut entry.nonce).is_err() {
             // Rollback both keys.
-            Self::clear_enabled_state(entry);
+            for kid in [
+                entry.establish_cred_key_id.take(),
+                entry.session_enc_key_id.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let _ = entry.vault.delete(kid);
+            }
+            entry.establish_cred_pub_key.fill(0);
+            entry.session_enc_pub_key.fill(0);
             return Err(HsmError::InternalError);
         }
 
-        if state == HsmPartState::Allocated {
-            entry.vm_launch_guid = STD_VM_LAUNCH_GUID;
-        }
-        entry.bk3_prov_credential.fill(0);
-        entry.bk3_prov_credential_set = false;
-        entry.sd_initialized = false;
+        Ok(())
+    }
 
-        entry.state = HsmPartState::Enabled;
+    /// Migrate partition `pid` in place (NSSR): on one device, what a live
+    /// migration does from a source device to a target. Mirrors the
+    /// reference firmware's `state.migrate()` and the Uno PAL's
+    /// `part_migrate`.
+    ///
+    /// Keeps the migrated state (sealed BK3 and its initialization flag,
+    /// `Masked_BK_BOOT`, VM launch GUID) and the established session slots,
+    /// marked for renegotiation; drops pending handshakes. Wipes the vault,
+    /// the per-tenant state and `PartInit`'s provisioning (see
+    /// [`clear_tenant_state`](Self::clear_tenant_state)), which returns the
+    /// PSKs to their defaults, then regenerates the partition identity and
+    /// the enable-time keys, leaving the partition `Enabled`. The partition
+    /// is `Disabled` until then, so a failure leaves it not serving; a later
+    /// NSSR retries the migration, and an enable restores it too. An
+    /// unallocated partition is left as it is.
+    pub async fn part_migrate_internal(&self, pid: u8) -> HsmResult<()> {
+        let idx = pid as usize;
+        if idx >= NUM_PARTITIONS {
+            return Err(HsmError::InvalidArg);
+        }
+        let entry = &mut self.table_mut().entries[idx];
+        if entry.state == HsmPartState::Unallocated {
+            return Ok(());
+        }
+        entry.state = HsmPartState::Disabled;
+        let mut session_table = core::mem::take(&mut entry.session_table);
+        let survivors = session_table.backup();
+        Self::clear_tenant_state(entry);
+        session_table.restore(survivors);
+        entry.session_table = session_table;
+        // A fresh identity, as on the Uno PAL: a new id blob here, and a new
+        // identity key below.
+        Rng::rand_bytes(&mut entry.id).map_err(|_| HsmError::InternalError)?;
+        self.provision_enabled_keys(pid).await?;
+        self.table_mut().entries[idx].state = HsmPartState::Enabled;
         Ok(())
     }
 
     /// Disable a partition: clear internal keys, nonce, vault, sessions.
-    ///
-    /// Preserves persistent BK3 provisioning across NSSR while clearing
-    /// volatile credentials.
     ///
     /// Transitions `Enabled → Disabled`.
     pub fn part_disable_internal(&self, pid: u8) -> HsmResult<()> {
@@ -1009,23 +1019,27 @@ impl StdHsmPal {
             return Err(HsmError::InvalidArg);
         }
 
-        // Preserve any live sessions across the NSSR as
+        // Preserve any live sessions across the disable as
         // NeedsRenegotiation so a subsequent ReopenSession can re-key
         // them (mirrors the reference firmware's `disable`, which does
         // `restore(backup())`).  The snapshot must be taken *before*
         // `clear_enabled_state` wipes the session table and vault.
         let entry = &mut table.entries[idx];
-        let session_backup = entry.session_table.backup();
+        let mut session_table = core::mem::take(&mut entry.session_table);
+        let session_backup = session_table.backup();
         Self::clear_enabled_state(entry);
-        entry.session_table.restore(session_backup);
+        session_table.restore(session_backup);
+        entry.session_table = session_table;
         entry.state = HsmPartState::Disabled;
         Ok(())
     }
 
     /// Free a partition: zeroize all material and release resources.
     ///
-    /// Accepts `Allocated | Enabled | Disabled → Unallocated`.
-    /// If `Enabled`, implicitly clears internal keys first.
+    /// Accepts `Allocated | Enabled | Disabled → Unallocated`. Clears the
+    /// enabled state first in every state, as the Uno PAL does: a failed
+    /// migration leaves a `Disabled` partition holding its sealed BK3 and
+    /// session reservations.
     pub fn part_free_internal(&self, pid: u8) -> HsmResult<()> {
         let table = self.table_mut();
         let idx = pid as usize;
@@ -1042,7 +1056,7 @@ impl StdHsmPal {
         // observe the partition was freed.
         entry.gen = entry.gen.wrapping_add(1);
 
-        // Also clear disabled entries: NSSR preserves their provisioning.
+        // Clear internal keys/nonce/vault/sessions and the migrated state.
         Self::clear_enabled_state(entry);
 
         // Zeroize identity material.
@@ -1057,11 +1071,10 @@ impl StdHsmPal {
         // enable/disable; it is cleared only here, on free.
         entry.masked_bk_boot[..entry.masked_bk_boot_len as usize].fill(0);
         entry.masked_bk_boot_len = 0;
-        entry.sealed_bk3[..entry.sealed_bk3_len as usize].fill(0);
-        entry.sealed_bk3_len = 0;
-        entry.vm_launch_guid.fill(0);
-        entry.bk3_initialized = false;
-        entry.fips_provisioning_status = 0;
+
+        // The published unwrapping key likewise lives until free; dropping it
+        // zeroizes it.
+        entry.unwrapping_key_bk = None;
 
         // Release resources.
         table.global_res_mask &= !entry.res_mask;
@@ -1085,10 +1098,10 @@ impl StdHsmPal {
     /// derivation can split off the public half); every other kind stores
     /// the bare raw HSM-format private scalar `d` (48 B for P-384).
     ///
-    /// `big_endian` selects the public-key byte order (the BE↔LE flip is
-    /// the driver's responsibility): [`HsmByteOrder::Be`] yields
+    /// `form` selects the public-key layout (the conversion is the
+    /// driver's responsibility): [`EccForm::BE`] yields exact-width
     /// big-endian coordinates for internally-consumed keys (cert
-    /// generation / POTA hashing); the PAL operand order yields the DDI
+    /// generation / POTA hashing); the PAL operand form yields the DDI
     /// wire form for wire-only keys.
     ///
     /// Bypasses [`HsmEcc::ecc_gen_keypair`] (which now requires an
@@ -1104,13 +1117,13 @@ impl StdHsmPal {
         kind: HsmVaultKeyKind,
         attrs: HsmVaultKeyAttrs,
         pct: HsmEccPct,
-        order: HsmByteOrder,
+        form: EccForm,
         pub_key_out: &mut [u8; P384_PUB_KEY_LEN],
     ) -> HsmResult<HsmKeyId> {
         // Generate the keypair; the driver owns the public-key byte
         // order, so this layer stays free of byte-shuffling boilerplate.
         let (pk, pub_key) = self.ecc.gen_keypair(EccCurve::P384).await?;
-        self.ecc.pub_coords(&pub_key, order, pub_key_out).await?;
+        self.ecc.pub_coords(&pub_key, form, pub_key_out).await?;
 
         // Export the private key as raw HSM scalar bytes (48 B for P-384).
         // `Zeroizing` scrubs the transient heap copy on drop once the vault
@@ -1126,8 +1139,8 @@ impl StdHsmPal {
                 _ => HsmError::PartitionIdKeyGenerationPctFailed,
             };
             let vault_key = EccPrivateKey::from_hsm_bytes(&priv_buf).map_err(|_| error)?;
-            let output_public = Self::ecc_public_from_wire(EccCurve::P384, pub_key_out, order)
-                .map_err(|_| error)?;
+            let output_public =
+                Self::ecc_public_from_wire(EccCurve::P384, pub_key_out, form).map_err(|_| error)?;
             if !self.ecc_pair_pct(&vault_key, &output_public, pct).await? {
                 return Err(error);
             }
@@ -1153,37 +1166,46 @@ impl StdHsmPal {
         entry.vault.create(&key_blob, kind, None, attrs)
     }
 
-    /// Clear enable-time keys, credentials, nonce, vault and sessions.
+    /// Clear all state associated with an enabled partition: its per-tenant
+    /// state and `PartInit`'s provisioning (see
+    /// [`clear_tenant_state`](Self::clear_tenant_state)) and its migrated
+    /// state (sealed BK3, VM launch GUID, BK3 init state and BK3 provisioning
+    /// classification).  Does NOT change the state field.
     ///
-    /// Retains masked BK_BOOT, sealed BK3, launch GUID and BK3 classification.
-    /// Full partition teardown clears them in `part_free_internal`.
-    /// Does not change lifecycle state.
+    /// This is the clearing site shared by `part_disable_internal` and
+    /// `part_free_internal`; it mirrors the prior reference firmware's
+    /// `clear_partition_info` grouping so that `sealed_bk3`,
+    /// `vm_launch_guid`, and BK3 init state and classification are all
+    /// zeroized together whenever the partition's enabled lifecycle ends.
     fn clear_enabled_state(entry: &mut PartitionEntry) {
-        // Drop a vault-backed key if present and best-effort delete its
-        // backing slot.  Vault errors are ignored: the slot is about
-        // to be overwritten or released wholesale.
-        fn drop_key(vault: &mut KeyVault, kid: &mut Option<HsmKeyId>) {
-            if let Some(k) = kid.take() {
-                let _ = vault.delete(k);
-            }
-        }
+        Self::clear_tenant_state(entry);
 
-        // Zeroize an `Option<[u8; N]>` payload in place before
-        // dropping the `Some`, so the bytes that live inside the
-        // entry struct are overwritten (not just the discriminant —
-        // `Option<[u8; N]>` has no niche, so payload storage is
-        // stable).
-        fn drop_secret<const N: usize>(slot: &mut Option<[u8; N]>) {
-            if let Some(buf) = slot.as_mut() {
-                buf.fill(0);
-            }
-            *slot = None;
-        }
+        // Variable-length opaque blobs — zeroize only the valid
+        // prefix to keep `clear_enabled_state` proportional to
+        // touched bytes.
+        entry.sealed_bk3[..entry.sealed_bk3_len as usize].fill(0);
+        entry.sealed_bk3_len = 0;
 
+        // Boot-key + BK3-incarnation state — mirrors the prior
+        // reference firmware's `clear_partition_info` zeroize
+        // grouping.
+        entry.vm_launch_guid.fill(0);
+        entry.bk3_initialized = false;
+        entry.fips_provisioning_status = HsmFipsProvStatus::NotApproved;
+    }
+
+    /// Clear the per-tenant state of a partition, which a live migration
+    /// does not carry: its vault and the key handles into it, identity key
+    /// and certificate, enable-time public keys, nonce, sessions,
+    /// credential, BK3 session key and security-domain initialization; and
+    /// `PartInit`'s policy hash, so the partition is provisioned afresh; and
+    /// return its PSKs to their defaults.  Leaves the migrated state and the
+    /// state field.
+    fn clear_tenant_state(entry: &mut PartitionEntry) {
         // Vault-backed keys whose ids live in this entry.  `id_key_id`
-        // is taken (rather than vault-deleted) so `part_enable_internal`
-        // knows to regenerate the identity key on the next enable; the
-        // vault itself is cleared wholesale below.
+        // is taken (rather than vault-deleted) so `provision_enabled_keys`
+        // knows to regenerate the identity key; the vault itself is
+        // cleared wholesale below.
         drop_key(&mut entry.vault, &mut entry.establish_cred_key_id);
         drop_key(&mut entry.vault, &mut entry.session_enc_key_id);
         drop_key(&mut entry.vault, &mut entry.mk_key_id);
@@ -1206,8 +1228,11 @@ impl StdHsmPal {
         entry.vault.clear();
         entry.session_table = SessionTable::new();
 
+        // Volatile secure-BK3 provisioning ID/PIN.
         entry.bk3_prov_credential.fill(0);
         entry.bk3_prov_credential_set = false;
+
+        // The security domain's masking key went with the vault.
         entry.sd_initialized = false;
 
         // Caller-presented secrets and per-session derived material.
@@ -1216,13 +1241,34 @@ impl StdHsmPal {
         entry.bk3_session.fill(0);
         entry.bk3_session_set = false;
 
-        // Provisioning material (write-once fields bound by PartInit).
-        drop_secret(&mut entry.policy_hash);
-
-        // Rotated PSK material.
+        // Rotated PSK material: the PSKs return to their defaults.
         drop_secret(&mut entry.psk_co);
         drop_secret(&mut entry.psk_cu);
+
+        // `PartInit`'s write-once policy hash (the PTA key went with the
+        // vault above).
+        drop_secret(&mut entry.policy_hash);
     }
+}
+
+/// Drop a vault-backed key if present and best-effort delete its backing
+/// slot.  Vault errors are ignored: the slot is about to be overwritten or
+/// released wholesale.
+fn drop_key(vault: &mut KeyVault, kid: &mut Option<HsmKeyId>) {
+    if let Some(k) = kid.take() {
+        let _ = vault.delete(k);
+    }
+}
+
+/// Zeroize an `Option<[u8; N]>` payload in place before dropping the
+/// `Some`, so the bytes that live inside the entry struct are overwritten
+/// (not just the discriminant — `Option<[u8; N]>` has no niche, so payload
+/// storage is stable).
+fn drop_secret<const N: usize>(slot: &mut Option<[u8; N]>) {
+    if let Some(buf) = slot.as_mut() {
+        buf.fill(0);
+    }
+    *slot = None;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1325,8 +1371,12 @@ impl PartitionEntry {
             HsmPartPropId::SD_INITIALIZED => Ok(u32::from(self.sd_initialized)),
             HsmPartPropId::FIRMWARE_FIPS_APPROVED => Ok(u32::from(self.firmware_fips_approved)),
             HsmPartPropId::FIPS_APPROVED => Ok(u32::from(
-                self.firmware_fips_approved && self.fips_provisioning_status == 1,
+                self.firmware_fips_approved
+                    && self.fips_provisioning_status == HsmFipsProvStatus::SecureApproved,
             )),
+            HsmPartPropId::BK3_PROVISIONING_STATUS => {
+                Ok(u32::from(self.fips_provisioning_status as u8))
+            }
             HsmPartPropId::PART_ID_ECC_KEY_ID => key_id_to_u32(self.id_key_id),
             HsmPartPropId::MK_KEY_ID => key_id_to_u32(self.mk_key_id),
             HsmPartPropId::UPS_KEY_ID => key_id_to_u32(self.ups_key_id),
@@ -1421,6 +1471,18 @@ impl PartitionEntry {
                     return Err(HsmError::SdAlreadyInitialized);
                 }
                 self.sd_initialized = want;
+                Ok(())
+            }
+            HsmPartPropId::BK3_PROVISIONING_STATUS => {
+                // Classification only; reset happens PAL-internally.
+                let status = match HsmFipsProvStatus::from_u8(value as u8) {
+                    Some(
+                        status @ (HsmFipsProvStatus::SecureApproved
+                        | HsmFipsProvStatus::LegacyUnapproved),
+                    ) => status,
+                    _ => return Err(HsmError::InvalidArg),
+                };
+                self.fips_provisioning_status = status;
                 Ok(())
             }
             // GEN/SVN/RES_COUNT/PART_ID_ECC_KEY_ID are Ro
@@ -1584,6 +1646,10 @@ impl PartitionEntry {
             }
             HsmPartPropId::NONCE => {
                 self.nonce.copy_from_slice(data);
+                Ok(())
+            }
+            HsmPartPropId::ESTABLISH_CRED_ECC_PUB_KEY => {
+                self.establish_cred_pub_key.copy_from_slice(data);
                 Ok(())
             }
             // ID/VM_LAUNCH_GUID are Ro —
@@ -1839,11 +1905,15 @@ mod tests {
         let io = StdHsmIo::admin(HsmPartId::from(0u8), 0, tx);
         for firmware in [false, true] {
             pal.test_set_firmware_fips_approved(io.pid(), firmware);
-            for status in [0, 1, 2, u8::MAX] {
+            for status in [
+                HsmFipsProvStatus::NotApproved,
+                HsmFipsProvStatus::SecureApproved,
+                HsmFipsProvStatus::LegacyUnapproved,
+            ] {
                 pal.table_mut().entries[0].fips_provisioning_status = status;
                 assert_eq!(
                     pal.part_prop_get_bool(&io, HsmPartPropId::FIPS_APPROVED),
-                    Ok(firmware && status == 1)
+                    Ok(firmware && status == HsmFipsProvStatus::SecureApproved)
                 );
             }
         }
@@ -1885,6 +1955,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unwrapping_key_survives_migration_and_is_dropped_on_free() {
+        let (_tx, rx) = async_channel::bounded(1);
+        let pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
+        pal.part_alloc_internal(1, 1)
+            .await
+            .expect("allocate partition");
+        let pid = HsmPartId::from(1u8);
+        pal.provision_unwrapping_key(pid).expect("generate");
+        let published = pal.active_part(pid).unwrap().unwrapping_key_bk.clone();
+        assert!(published.is_some());
+
+        pal.part_migrate_internal(1).await.expect("migrate");
+        assert!(pal.active_part(pid).unwrap().unwrapping_key_id.is_none());
+        pal.provision_unwrapping_key(pid).expect("re-import");
+        let entry = pal.active_part(pid).unwrap();
+        let kid = entry.unwrapping_key_id.expect("imported");
+        assert_eq!(
+            entry.vault.key(kid).unwrap(),
+            published.as_ref().unwrap().as_slice()
+        );
+
+        pal.part_free_internal(1).unwrap();
+        assert!(pal.table().entries[1].unwrapping_key_bk.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_migration_leaves_partition_disabled_until_retried() {
+        let (_tx, rx) = async_channel::bounded(1);
+        let pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
+        pal.part_alloc_internal(1, 1)
+            .await
+            .expect("allocate partition");
+        pal.part_enable_internal(1).await.expect("enable");
+        pal.table_mut().entries[1].state = HsmPartState::Initialized;
+
+        pal.ecc_pct_fail.set(true);
+        assert!(pal.part_migrate_internal(1).await.is_err());
+        assert_eq!(pal.table().entries[1].state, HsmPartState::Disabled);
+
+        pal.ecc_pct_fail.set(false);
+        pal.part_migrate_internal(1)
+            .await
+            .expect("retried migration");
+        let entry = &pal.table().entries[1];
+        assert_eq!(entry.state, HsmPartState::Enabled);
+        assert!(entry.id_key_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_migration_keeps_migrated_state_until_enable_or_free() {
+        let (_tx, rx) = async_channel::bounded(1);
+        let pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
+        pal.part_alloc_internal(1, 1)
+            .await
+            .expect("allocate partition");
+        pal.part_enable_internal(1).await.expect("enable");
+        let entry = &mut pal.table_mut().entries[1];
+        entry.sealed_bk3[..4].copy_from_slice(&[1, 2, 3, 4]);
+        entry.sealed_bk3_len = 4;
+        entry.bk3_initialized = true;
+        let session = entry
+            .session_table
+            .create(HsmKeyId::from(1))
+            .expect("session");
+
+        // An enable completes the failed migration, keeping BK3's one-shot
+        // initialization with the sealed BK3.
+        pal.ecc_pct_fail.set(true);
+        assert!(pal.part_migrate_internal(1).await.is_err());
+        pal.ecc_pct_fail.set(false);
+        pal.part_enable_internal(1).await.expect("enable");
+        let entry = &pal.table().entries[1];
+        assert!(entry.bk3_initialized);
+        assert_eq!(entry.sealed_bk3_len, 4);
+        assert!(matches!(
+            entry.session_table.state(session),
+            HsmSessionState::NeedsRenegotiation
+        ));
+
+        // A free leaves none of it to the next allocation.
+        pal.ecc_pct_fail.set(true);
+        assert!(pal.part_migrate_internal(1).await.is_err());
+        pal.ecc_pct_fail.set(false);
+        pal.part_free_internal(1).expect("free");
+        pal.part_alloc_internal(1, 1)
+            .await
+            .expect("reallocate partition");
+        let entry = &pal.table().entries[1];
+        assert!(!entry.bk3_initialized);
+        assert_eq!(entry.sealed_bk3_len, 0);
+        assert!(matches!(
+            entry.session_table.state(session),
+            HsmSessionState::Invalid
+        ));
+    }
+
+    #[tokio::test]
     async fn internal_key_pct_failure_reports_key_kind() {
         let (_tx, rx) = async_channel::bounded(1);
         let pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
@@ -1915,7 +2082,7 @@ mod tests {
                     kind,
                     HsmVaultKeyAttrs::new(),
                     pct,
-                    StdHsmPal::BYTE_ORDER,
+                    EccForm::of::<StdHsmPal>(),
                     &mut public,
                 )
                 .await
@@ -1926,44 +2093,20 @@ mod tests {
     }
 
     #[test]
-    fn bk3_commit_replaces_missing_boot_only_after_validation() -> HsmResult<()> {
-        for secure in [false, true] {
-            let pal = StdHsmPal::default();
-            let (tx, _rx) = tokio::sync::oneshot::channel();
-            let io = StdHsmIo::admin(HsmPartId::from(0u8), 0, tx);
+    fn bk3_provisioning_status_accepts_only_secure_or_legacy() {
+        let id = HsmPartPropId::BK3_PROVISIONING_STATUS;
+        let mut entry = fresh_entry();
+        for invalid in [0, 3] {
             assert!(matches!(
-                pal.part_commit_bk3(&io, secure, None),
+                entry.prop_set_scalar(id, invalid),
                 Err(HsmError::InvalidArg)
             ));
-
-            let oversized = pal.dma_alloc(&io, MASKED_BK_BOOT_LEN + 1)?;
-            let (empty, _) = oversized.split_at(0);
-            for boot in [empty, &*oversized] {
-                assert!(matches!(
-                    pal.part_commit_bk3(&io, secure, Some(boot)),
-                    Err(HsmError::InvalidArg)
-                ));
-            }
-            assert_eq!(pal.table().entries[0].masked_bk_boot_len, 0);
-            assert!(!pal.table().entries[0].bk3_initialized);
-            assert_eq!(pal.table().entries[0].fips_provisioning_status, 0);
-
-            let boot = pal.dma_alloc(&io, 80)?;
-            boot.fill(0x77);
-            pal.part_commit_bk3(&io, secure, Some(boot))?;
-            assert_eq!(pal.table().entries[0].masked_bk_boot_len, 80);
-            assert_eq!(&pal.table().entries[0].masked_bk_boot[..80], &[0x77; 80]);
-            assert!(pal.table().entries[0].bk3_initialized);
-            assert_eq!(
-                pal.table().entries[0].fips_provisioning_status,
-                if secure { 1 } else { 2 }
-            );
-            assert!(matches!(
-                pal.part_commit_bk3(&io, secure, Some(boot)),
-                Err(HsmError::Bk3AlreadyInitialized)
-            ));
         }
-        Ok(())
+        assert_eq!(entry.prop_get_scalar(id).unwrap(), 0);
+        for status in [1, 2] {
+            entry.prop_set_scalar(id, status).unwrap();
+            assert_eq!(entry.prop_get_scalar(id).unwrap(), status);
+        }
     }
 
     #[test]
@@ -1990,11 +2133,14 @@ mod tests {
         StdHsmPal::clear_enabled_state(&mut entry);
         assert_eq!(entry.bk3_prov_credential, [0; 32]);
         assert!(!entry.bk3_prov_credential_set);
-        assert_eq!(entry.fips_provisioning_status, 0);
+        assert_eq!(
+            entry.fips_provisioning_status,
+            HsmFipsProvStatus::NotApproved
+        );
     }
 
     #[tokio::test]
-    async fn bk3_provisioning_survives_nssr_without_volatile_credentials() -> HsmResult<()> {
+    async fn bk3_provisioning_survives_nssr_but_not_disable() -> HsmResult<()> {
         let (_tx, rx) = async_channel::bounded(1);
         let pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
         {
@@ -2009,13 +2155,13 @@ mod tests {
         let sealed = [0x72; 64];
         // Include fresh, unsealed, sealed and explicitly cleared BK3 states.
         for (initialized, status, has_boot, has_sealed) in [
-            (false, 0, true, false),
-            (true, 0, true, true),
-            (true, 2, true, false),
-            (true, 1, true, false),
-            (true, 2, true, true),
-            (true, 1, true, true),
-            (false, 0, false, false),
+            (false, HsmFipsProvStatus::NotApproved, true, false),
+            (true, HsmFipsProvStatus::NotApproved, true, true),
+            (true, HsmFipsProvStatus::LegacyUnapproved, true, false),
+            (true, HsmFipsProvStatus::SecureApproved, true, false),
+            (true, HsmFipsProvStatus::LegacyUnapproved, true, true),
+            (true, HsmFipsProvStatus::SecureApproved, true, true),
+            (false, HsmFipsProvStatus::NotApproved, false, false),
         ] {
             {
                 let entry = &mut pal.table_mut().entries[0];
@@ -2050,24 +2196,15 @@ mod tests {
                     (entry.nonce, entry.establish_cred_pub_key)
                 };
 
-                pal.part_disable_internal(0)?;
-                {
-                    let entry = &pal.table().entries[0];
-                    assert_eq!(entry.state, HsmPartState::Disabled);
-                    assert_eq!(entry.credential, [0; 32]);
-                    assert!(!entry.credential_set);
-                    assert_eq!(entry.bk3_prov_credential, [0; 32]);
-                    assert!(!entry.bk3_prov_credential_set);
-                    assert_eq!(entry.bk3_session, [0; 48]);
-                    assert!(!entry.bk3_session_set);
-                    assert_eq!(entry.nonce, [0; NONCE_LEN]);
-                    assert!(entry.establish_cred_key_id.is_none());
-                    assert!(entry.session_enc_key_id.is_none());
-                }
-
-                pal.part_enable_internal(0).await?;
+                pal.part_migrate_internal(0).await?;
                 let entry = &pal.table().entries[0];
                 assert_eq!(entry.state, HsmPartState::Enabled);
+                assert_eq!(entry.credential, [0; 32]);
+                assert!(!entry.credential_set);
+                assert_eq!(entry.bk3_prov_credential, [0; 32]);
+                assert!(!entry.bk3_prov_credential_set);
+                assert_eq!(entry.bk3_session, [0; 48]);
+                assert!(!entry.bk3_session_set);
                 assert_eq!(
                     entry.masked_bk_boot_len as usize,
                     if has_boot { boot.len() } else { 0 }
@@ -2091,6 +2228,28 @@ mod tests {
                 assert_ne!(entry.establish_cred_pub_key, old_public_key);
             }
         }
+
+        // Disable revokes the migrated BK3 state but keeps Masked_BK_BOOT.
+        {
+            let entry = &mut pal.table_mut().entries[0];
+            entry.masked_bk_boot[..boot.len()].copy_from_slice(&boot);
+            entry.masked_bk_boot_len = boot.len() as u32;
+            entry.sealed_bk3[..sealed.len()].copy_from_slice(&sealed);
+            entry.sealed_bk3_len = sealed.len() as u32;
+            entry.bk3_initialized = true;
+            entry.fips_provisioning_status = HsmFipsProvStatus::SecureApproved;
+        }
+        pal.part_disable_internal(0)?;
+        let entry = &pal.table().entries[0];
+        assert_eq!(entry.state, HsmPartState::Disabled);
+        assert_eq!(entry.masked_bk_boot_len as usize, boot.len());
+        assert_eq!(entry.sealed_bk3_len, 0);
+        assert!(!entry.bk3_initialized);
+        assert_eq!(
+            entry.fips_provisioning_status,
+            HsmFipsProvStatus::NotApproved
+        );
+        assert_eq!(entry.vm_launch_guid, [0; VM_LAUNCH_GUID_LEN]);
         Ok(())
     }
 
@@ -2111,7 +2270,7 @@ mod tests {
                 entry.sealed_bk3[..64].fill(0x72);
                 entry.sealed_bk3_len = 64;
                 entry.bk3_initialized = true;
-                entry.fips_provisioning_status = 1;
+                entry.fips_provisioning_status = HsmFipsProvStatus::SecureApproved;
                 entry.vm_launch_guid = [0x73; VM_LAUNCH_GUID_LEN];
             }
             pal.part_free_internal(0)?;
@@ -2122,7 +2281,10 @@ mod tests {
             assert_eq!(entry.sealed_bk3, [0; SEALED_BK3_SIZE]);
             assert_eq!(entry.sealed_bk3_len, 0);
             assert!(!entry.bk3_initialized);
-            assert_eq!(entry.fips_provisioning_status, 0);
+            assert_eq!(
+                entry.fips_provisioning_status,
+                HsmFipsProvStatus::NotApproved
+            );
             assert_eq!(entry.vm_launch_guid, [0; VM_LAUNCH_GUID_LEN]);
         }
         Ok(())
@@ -2410,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn psk_reset_on_disable_and_reenable() {
+    async fn psks_reset_on_migration_and_disable_and_clear_on_free() {
         let (_tx, rx) = async_channel::bounded(1);
         let mut pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
         let entry = &mut pal.part_table.get_mut().entries[0];
@@ -2420,38 +2582,23 @@ mod tests {
         pal.part_enable_internal(0).await.unwrap();
 
         for round in 0..2u8 {
-            let psk_co = [0xA1 + round; PSK_LEN];
-            let psk_cu = [0xB1 + round; PSK_LEN];
             let entry = &mut pal.table_mut().entries[0];
             entry
-                .prop_set_bytes(HsmPartPropId::PSK_CO, &psk_co)
+                .prop_set_bytes(HsmPartPropId::PSK_CO, &[0xA1 + round; PSK_LEN])
                 .unwrap();
-            assert_eq!(
-                entry.prop_get_bytes(HsmPartPropId::PSK_CU).unwrap(),
-                DEFAULT_PSK_CU.as_slice()
-            );
             entry
-                .prop_set_bytes(HsmPartPropId::PSK_CU, &psk_cu)
+                .prop_set_bytes(HsmPartPropId::PSK_CU, &[0xB1 + round; PSK_LEN])
                 .unwrap();
 
-            assert_eq!(pal.part_enable_internal(0).await, Err(HsmError::InvalidArg));
-            let entry = &pal.table().entries[0];
-            assert_eq!(
-                entry.prop_get_bytes(HsmPartPropId::PSK_CO).unwrap(),
-                &psk_co
-            );
-            assert_eq!(
-                entry.prop_get_bytes(HsmPartPropId::PSK_CU).unwrap(),
-                &psk_cu
-            );
-
-            pal.part_disable_internal(0).unwrap();
-            let entry = &pal.table().entries[0];
-            assert_eq!(entry.state, HsmPartState::Disabled);
-            assert!(entry.psk_co.is_none());
-            assert!(entry.psk_cu.is_none());
-
-            pal.part_enable_internal(0).await.unwrap();
+            // The PSKs are not migrated, and a disable drops them too: an NSSR
+            // or a disable and re-enable returns them to their defaults, as on
+            // the Uno PAL.
+            if round == 0 {
+                pal.part_migrate_internal(0).await.unwrap();
+            } else {
+                pal.part_disable_internal(0).unwrap();
+                pal.part_enable_internal(0).await.unwrap();
+            }
             let entry = &pal.table().entries[0];
             assert_eq!(entry.state, HsmPartState::Enabled);
             assert_eq!(
@@ -2476,6 +2623,49 @@ mod tests {
         assert_eq!(entry.state, HsmPartState::Unallocated);
         assert!(entry.psk_co.is_none());
         assert!(entry.psk_cu.is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_keeps_migrated_state_and_renews_tenant_state() {
+        let (_tx, rx) = async_channel::bounded(1);
+        let mut pal = StdHsmPal::new(rx, tokio::runtime::Handle::current());
+        let entry = &mut pal.part_table.get_mut().entries[0];
+        entry.state = HsmPartState::Allocated;
+        entry.res_mask = 1;
+        entry.vault = KeyVault::new(1);
+        pal.part_enable_internal(0).await.unwrap();
+
+        let entry = &mut pal.table_mut().entries[0];
+        entry.sealed_bk3[..4].copy_from_slice(&[1, 2, 3, 4]);
+        entry.sealed_bk3_len = 4;
+        entry.bk3_initialized = true;
+        entry.sd_initialized = true;
+        entry.policy_hash = Some([0x5A; POLICY_HASH_LEN]);
+        entry
+            .prop_set_bytes(HsmPartPropId::CREDENTIAL, &[0x5A; 32])
+            .unwrap();
+        let (id, ec_pub, nonce) = (entry.id, entry.establish_cred_pub_key, entry.nonce);
+
+        pal.part_migrate_internal(0).await.unwrap();
+
+        let entry = &pal.table().entries[0];
+        assert_eq!(entry.state, HsmPartState::Enabled);
+        // The migrated state is kept.
+        assert_eq!(
+            &entry.sealed_bk3[..entry.sealed_bk3_len as usize],
+            &[1, 2, 3, 4]
+        );
+        assert!(entry.bk3_initialized);
+        assert_eq!(entry.vm_launch_guid, STD_VM_LAUNCH_GUID);
+        // The per-tenant state and `PartInit`'s provisioning are not: a fresh
+        // identity, keys and nonce, and no policy hash.
+        assert!(entry.policy_hash.is_none());
+        assert!(!entry.credential_set);
+        assert!(!entry.sd_initialized);
+        assert_ne!(entry.id, id);
+        assert!(entry.id_key_id.is_some());
+        assert_ne!(entry.establish_cred_pub_key, ec_pub);
+        assert_ne!(entry.nonce, nonce);
     }
 
     // ── Phase A new-id coverage ────────────────────────────────────

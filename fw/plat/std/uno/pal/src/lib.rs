@@ -134,6 +134,7 @@ impl HsmPalFeatures for StdHsmPal {
 /// Crypto operands are little-endian (word-padded P-521 slots).
 impl HsmCryptoOrder for StdHsmPal {
     const BYTE_ORDER: HsmByteOrder = HsmByteOrder::Le;
+    const ECC_COORD_PAD: usize = 4;
 }
 
 #[cfg(test)]
@@ -209,7 +210,7 @@ mod fips_tests {
         req: impl TborOpReq,
     ) -> (u32, bool) {
         let mut src = Page([0; 4096]);
-        let len = req.encode_request(&mut src.0).unwrap().len();
+        let len = req.encode_request(&mut src.0, (1, 1)).unwrap().len();
         let bytes = execute_wire(hsm, submit, OP_TBOR, &src, len).await;
         let resp = ResponseView::parse(&bytes).unwrap();
         (resp.status(), resp.fips_approved())
@@ -323,7 +324,16 @@ mod fips_tests {
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let io = StdHsmIo::admin(pid, 0, tx);
-        hsm.pal().part_commit_bk3(&io, true, None).unwrap();
+        hsm.pal()
+            .part_prop_set_bool(&io, HsmPartPropId::BK3_INITIALIZED, true)
+            .unwrap();
+        hsm.pal()
+            .part_prop_set_u8(
+                &io,
+                HsmPartPropId::BK3_PROVISIONING_STATUS,
+                HsmFipsProvStatus::SecureApproved as u8,
+            )
+            .unwrap();
         assert_eq!(info(&hsm, &submit).await, (true, true));
         let bytes = execute(
             &hsm,
@@ -340,8 +350,7 @@ mod fips_tests {
         hsm.pal().test_set_firmware_fips_approved(pid, false);
         assert_eq!(info(&hsm, &submit).await, (true, false));
         hsm.pal().test_set_firmware_fips_approved(pid, true);
-        hsm.pal().part_disable_internal(0).unwrap();
-        hsm.pal().part_enable_internal(0).await.unwrap();
+        hsm.pal().part_migrate_internal(0).await.unwrap();
         assert_eq!(info(&hsm, &submit).await, (true, true));
 
         let bytes = execute(
@@ -362,7 +371,16 @@ mod fips_tests {
         assert_eq!(info(&hsm, &submit).await, (true, false));
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let io = StdHsmIo::admin(pid, 0, tx);
-        hsm.pal().part_commit_bk3(&io, false, None).unwrap();
+        hsm.pal()
+            .part_prop_set_bool(&io, HsmPartPropId::BK3_INITIALIZED, true)
+            .unwrap();
+        hsm.pal()
+            .part_prop_set_u8(
+                &io,
+                HsmPartPropId::BK3_PROVISIONING_STATUS,
+                HsmFipsProvStatus::LegacyUnapproved as u8,
+            )
+            .unwrap();
         assert_eq!(
             info(&hsm, &submit).await,
             (true, false),

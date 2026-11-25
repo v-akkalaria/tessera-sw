@@ -21,8 +21,7 @@
 //! [`HsmPartitionLock::partition_lock`].  Read-only / hot-path
 //! partition getters do **not** take this lock.  The PAL also
 //! re-checks the one-shot state atomically inside
-//! [`HsmPartitionManager::part_commit_bk3`] so the lock is
-//! an optimization, not the correctness barrier.
+//! [`part_mark_bk3_initialized`](crate::part_state::part_mark_bk3_initialized).
 //!
 //! ## Masking
 //!
@@ -88,9 +87,10 @@ const BK3_KEY_ATTRIBUTES: HsmVaultKeyAttrs = HsmVaultKeyAttrs::new()
 /// 3. Frame the response, then AES-CBC-256 + HMAC-SHA-384 mask BK3
 ///    under `BK_BOOT` directly into the response buffer's
 ///    `masked_bk3` slot (no intermediate DMA copy).
-/// 4. Fill `vm_launch_guid` and atomically commit the one-shot gate and
-///    LegacyUnapproved classification. SecureInitBk3 shares the masking
-///    helper but commits SecureApproved after authenticating BK3.
+/// 4. Fill `vm_launch_guid`, then commit any replacement `BK_BOOT`, the
+///    one-shot gate and the `LegacyUnapproved` classification.
+///    SecureInitBk3 shares the masking helper but commits
+///    `SecureApproved` after authenticating BK3.
 ///
 /// All partition mutations happen at the end so any earlier failure
 /// leaves partition state untouched and the host can retry.
@@ -105,7 +105,7 @@ pub(crate) async fn init_bk3<'p, P: HsmPal>(
 
     let _lock = pal.partition_lock(io).await?;
 
-    mask_bk3(pal, io, body.bk3, hdr, false).await
+    mask_bk3(pal, io, body.bk3, hdr, HsmFipsProvStatus::LegacyUnapproved).await
 }
 
 /// Envelope BK3 under BK_BOOT, then commit its state and classification.
@@ -115,9 +115,9 @@ pub(super) async fn mask_bk3<'p, P: HsmPal>(
     io: &P::Io,
     bk3: &HsmDmaBuf,
     hdr: &DdiReqHdr,
-    secure: bool,
+    status: HsmFipsProvStatus,
 ) -> HsmResult<&'p HsmDmaBuf> {
-    // Fail-fast; the authoritative commit below re-checks atomically.
+    // Fail fast; the PAL rechecks this at commit.
     if crate::part_state::part_is_bk3_initialized(pal, io)? {
         return Err(HsmError::Bk3AlreadyInitialized);
     }
@@ -137,8 +137,8 @@ pub(super) async fn mask_bk3<'p, P: HsmPal>(
         key_length: BK3_LEN as u16,
     };
 
-    // ClearBk3 leaves BK_BOOT zeroized. Recreate it during initialization
-    // and publish the replacement only at the final commit.
+    // Allocation normally supplies BK_BOOT. The FIPS-only ClearBk3
+    // action can remove it; initialization only recreates an absent key.
     let new_masked_boot = match crate::part_state::part_masked_bk_boot(pal, io) {
         Ok(_) => None,
         Err(HsmError::PartPropNotFound) => {
@@ -180,9 +180,15 @@ pub(super) async fn mask_bk3<'p, P: HsmPal>(
             .copy_from_slice(&guid[..vm_launch_guid_len]);
     }
 
-    // Last fallible operation. Transport delivery can still fail after
-    // commit; neither init path rolls provisioning back on a lost response.
-    pal.part_commit_bk3(io, secure, new_masked_boot.as_deref())?;
+    // Authoritative one-shot commit, after the optional replacement boot
+    // key and before the classification, which the PAL also treats as
+    // initialized. Transport delivery can still fail after commit;
+    // neither init path rolls provisioning back on a lost response.
+    if let Some(boot) = new_masked_boot.as_deref() {
+        crate::part_state::part_set_masked_bk_boot(pal, io, boot)?;
+    }
+    crate::part_state::part_mark_bk3_initialized(pal, io)?;
+    crate::part_state::part_set_bk3_provisioning_status(pal, io, status)?;
 
     Ok(resp)
 }

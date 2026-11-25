@@ -19,14 +19,14 @@ fn clear_bk3_wipes_material_and_preserves_unrelated_partition_state() -> HsmResu
     p.set_sealed_bk3(buf(&[0x72; SEALED_BK3_DATA_LEN]))?;
     p.set_bk3_session(buf(&[0x73; 48]))?;
     p.set_bk3_initialized(true);
-    p.set_fips_status(1);
+    p.set_fips_status(HsmFipsProvStatus::SecureApproved);
     p.set_credential(buf(&[0x74; 32]))?;
     p.set_nonce(buf(&[0x75; 32]))?;
     p.set_mk_key_id(Some(HsmKeyId::from(0x1234)));
     p.set_vm_launch_guid(&[0x76; 16]);
     for _ in 0..2 {
         p.clear_bk3_info();
-        assert_eq!(p.fips_status(), 0);
+        assert_eq!(p.fips_status(), HsmFipsProvStatus::NotApproved);
         assert!(!p.bk3_initialized());
         assert!(p.masked_bk_boot().is_empty());
         assert!(p.sealed_bk3().is_empty());
@@ -47,7 +47,11 @@ fn clear_bk3_wipes_material_and_preserves_unrelated_partition_state() -> HsmResu
 #[test]
 fn migrated_bk3_is_initialized_without_uno_flag() -> HsmResult<()> {
     let p = Partition(58);
-    for status in [0, 1, 2] {
+    for status in [
+        HsmFipsProvStatus::NotApproved,
+        HsmFipsProvStatus::SecureApproved,
+        HsmFipsProvStatus::LegacyUnapproved,
+    ] {
         p.reset();
         p.set_masked_bk_boot(buf(&[0x71; 80]))?;
         assert!(
@@ -56,7 +60,7 @@ fn migrated_bk3_is_initialized_without_uno_flag() -> HsmResult<()> {
         );
         // Simulate Admin's shared-prefix restore, including a pre-1.1 source
         // that carries a sealed blob but no provisioning classification.
-        if status == 0 {
+        if status == HsmFipsProvStatus::NotApproved {
             p.set_sealed_bk3(buf(&[0x72; 64]))?;
         }
         p.set_fips_status(status);
@@ -86,15 +90,15 @@ fn bk3_schema_upgrade_preserves_version_one_partition() {
     slot.state = [0; 3];
     p.upgrade_bk3_schema();
     assert_eq!(p.state().unwrap(), HsmPartState::Enabled);
-    assert_eq!(p.fips_status(), 0);
+    assert_eq!(p.fips_status(), HsmFipsProvStatus::NotApproved);
     assert!(p.bk3_initialized());
     assert_eq!(p.ec_key_id(), Some(HsmKeyId::from(0x1234)));
     assert_eq!(&p.masked_bk_boot()[..], &[0x51; 80]);
     assert_eq!(&p.sealed_bk3()[..], &[0x52; 64]);
     // Re-entering the boot upgrade must not revoke an already classified key.
-    p.set_fips_status(1);
+    p.set_fips_status(HsmFipsProvStatus::SecureApproved);
     p.upgrade_bk3_schema();
-    assert_eq!(p.fips_status(), 1);
+    assert_eq!(p.fips_status(), HsmFipsProvStatus::SecureApproved);
 }
 
 #[test]
@@ -121,7 +125,7 @@ fn bk3_schema_upgrade_resumes_after_state_is_copied() {
 
         assert_eq!(p.slot().version, STORE_VERSION);
         assert_eq!(p.state(), Ok(state));
-        assert_eq!(p.fips_status(), 0);
+        assert_eq!(p.fips_status(), HsmFipsProvStatus::NotApproved);
         assert_eq!(p.res_mask(), res_mask);
         assert_eq!(p.id_key_id(), key_id);
     }
@@ -129,19 +133,19 @@ fn bk3_schema_upgrade_resumes_after_state_is_copied() {
 
 #[test]
 fn bk3_status_survives_migrate_and_is_revoked_on_disable() {
-    let p = Partition(61);
+    let mut p = Partition(61);
     p.reset();
     p.set_masked_bk_boot(buf(&[0x53; 80])).unwrap();
     p.set_bk3_initialized(true);
-    p.set_fips_status(1);
+    p.set_fips_status(HsmFipsProvStatus::SecureApproved);
     p.clear_state(PartResetKind::Migrate);
-    assert_eq!(p.fips_status(), 1);
+    assert_eq!(p.fips_status(), HsmFipsProvStatus::SecureApproved);
     assert!(p.bk3_initialized());
     p.clear_state(PartResetKind::Disable);
-    assert_eq!(p.fips_status(), 0);
+    assert_eq!(p.fips_status(), HsmFipsProvStatus::NotApproved);
     assert!(!p.bk3_initialized());
-    p.set_fips_status(u8::MAX);
-    assert_eq!(p.fips_status(), 0);
+    p.slot_mut().fips_status = u8::MAX;
+    assert_eq!(p.fips_status(), HsmFipsProvStatus::NotApproved);
 }
 
 #[test]
@@ -207,9 +211,9 @@ fn disable_zeroizes_psks_and_default_baking_restores_bootstrap() {
     assert_eq!(&p.psk_cu()[..], &DEFAULT_PSK_CU);
 }
 
-/// `clear_state(Migrate)` must wipe per-tenant runtime state while keeping the
-/// partition's provisioning material intact (mirrors the reference
-/// `state.migrate()`). This is the regression guard for that split.
+/// `clear_state(Migrate)` must wipe per-tenant runtime state and `PartInit`'s
+/// provisioning while keeping the partition's migrated state intact. This is
+/// the regression guard for that split.
 ///
 /// This helper leaves the persistent session table untouched. The Uno PAL
 /// preserves established reservations on disable and NSSR/migrate, and
@@ -220,10 +224,13 @@ fn preserves_provisioning_and_clears_tenant_state() {
     // directly; `store_base()` backs it with real memory under `cfg(test)`.
     let pid = 7usize;
 
-    // Provisioning material — must survive a migrate.
+    // Rotated PSKs — returned to their defaults by a migrate.
     let psk_co = [0x11u8; PSK_LEN];
     let psk_cu = [0x22u8; PSK_LEN];
+    // Migrated state — must survive a migrate.
     let guid = [0x33u8; GUID_LEN];
+    // `PartInit` provisioning — must be cleared by a migrate.
+    let policy_hash = [0x44u8; POLICY_HASH_LEN];
 
     // Per-tenant state — must be cleared by a migrate.
     let nonce = [0x55u8; NONCE_LEN];
@@ -237,6 +244,7 @@ fn preserves_provisioning_and_clears_tenant_state() {
         p.set_psk_cu(buf(&psk_cu)).unwrap();
         p.set_vm_launch_guid(&guid);
         p.set_bk3_initialized(true);
+        p.set_policy_hash(buf(&policy_hash)).unwrap();
 
         p.set_nonce(buf(&nonce)).unwrap();
         p.set_credential(buf(&cred)).unwrap();
@@ -267,28 +275,33 @@ fn preserves_provisioning_and_clears_tenant_state() {
 
     let p = Partition(pid);
 
-    // Session PSKs are reset to the well-known defaults, not preserved:
-    // an NSSR returns the partition to its just-allocated state as far as
-    // the PSKs are concerned, so the rotated values seeded above must not
-    // survive.
+    // The PSKs are not migrated: each role rotates its PSK again.
     assert_eq!(
         &p.psk_co()[..],
-        &DEFAULT_PSK_CO[..],
-        "psk_co must be re-baked to the default on migrate"
+        &DEFAULT_PSK_CO,
+        "psk_co must reset to its default"
     );
     assert_eq!(
         &p.psk_cu()[..],
-        &DEFAULT_PSK_CU[..],
-        "psk_cu must be re-baked to the default on migrate"
+        &DEFAULT_PSK_CU,
+        "psk_cu must reset to its default"
     );
 
-    // Provisioning preserved.
+    // Migrated state preserved.
     assert_eq!(
         &p.vm_launch_guid()[..],
         &guid[..],
         "vm_launch_guid must survive migrate"
     );
     assert!(p.bk3_initialized(), "bk3_initialized must survive migrate");
+
+    // `PartInit` provisioning cleared.
+    assert!(!p.policy_hash_valid(), "policy hash must be cleared");
+    assert_eq!(
+        &p.policy_hash()[..],
+        &[0u8; POLICY_HASH_LEN][..],
+        "policy hash bytes must be zeroed"
+    );
 
     // Per-tenant state cleared.
     assert_eq!(
@@ -450,6 +463,29 @@ fn rearm_sets_gate1_only_for_resourced_partitions() {
     assert!(!empty.unwrapping_key_required());
 }
 
+/// Warm boots advance the transport epoch, which survives everything but
+/// a power-on `reset`, and report exhaustion once it saturates.
+#[test]
+fn transport_epoch_bumps_and_saturates() {
+    let mut p = Partition(60);
+    p.reset();
+    assert_eq!(p.transport_epoch(), Some(0));
+    PartStore::bump_transport_epochs();
+    assert_eq!(p.transport_epoch(), Some(1));
+    p.clear_state(PartResetKind::Disable);
+    assert_eq!(p.transport_epoch(), Some(1));
+
+    p.slot_mut().transport_epoch = (u16::MAX - 1).to_le_bytes();
+    assert_eq!(p.transport_epoch(), Some(u16::MAX - 1));
+    PartStore::bump_transport_epochs();
+    assert_eq!(p.transport_epoch(), None);
+    PartStore::bump_transport_epochs();
+    assert_eq!(p.transport_epoch(), None);
+
+    p.reset();
+    assert_eq!(p.transport_epoch(), Some(0));
+}
+
 /// The unwrapping-key slot's validity byte decodes to its three states, and
 /// any other byte decodes to `None`, which callers treat as not importable.
 #[test]
@@ -537,10 +573,10 @@ fn shadowed_fields_follow_writes() {
 
     Partition(pid).set_state(HsmPartState::Enabled);
     assert_eq!(Partition(pid).state().unwrap(), HsmPartState::Enabled);
-    Partition(pid).set_fips_status(1);
+    Partition(pid).set_fips_status(HsmFipsProvStatus::SecureApproved);
     assert_eq!(Partition(pid).state().unwrap(), HsmPartState::Enabled);
     assert!(Partition(pid).bk3_initialized());
-    Partition(pid).set_fips_status(0);
+    Partition(pid).set_fips_status(HsmFipsProvStatus::NotApproved);
     assert_eq!(Partition(pid).state().unwrap(), HsmPartState::Enabled);
     assert!(!Partition(pid).bk3_initialized());
     Partition(pid).set_bk3_initialized(true);

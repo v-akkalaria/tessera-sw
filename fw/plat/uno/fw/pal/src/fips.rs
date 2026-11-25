@@ -3,6 +3,7 @@
 
 //! Measured firmware approval and legacy bulk-FP service state.
 
+use tsra_fw_hsm_pal_traits::HsmFipsProvStatus;
 use tsra_fw_hsm_pal_traits::HsmResult;
 use tsra_fw_uno_drivers_part_store::HsmPartId;
 use tsra_fw_uno_drivers_part_store::NUM_PARTITIONS;
@@ -53,8 +54,8 @@ impl UnoHsmPal {
     }
 
     pub(crate) fn sync_fp_fips_approval(&self, pid: HsmPartId) -> HsmResult<()> {
-        let approved =
-            self.firmware_fips_approved(pid) && PartStore::partition(pid)?.fips_status() == 1;
+        let approved = self.firmware_fips_approved(pid)
+            && PartStore::partition(pid)?.fips_status() == HsmFipsProvStatus::SecureApproved;
         self.set_fp_fips_approved(pid, approved);
         Ok(())
     }

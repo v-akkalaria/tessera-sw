@@ -251,7 +251,14 @@ mod tests {
         pal.test_set_firmware_fips_approved(HsmPartId::from(PID), true);
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let io = StdHsmIo::admin(HsmPartId::from(PID), 0, tx);
-        pal.part_commit_bk3(&io, true, None).unwrap();
+        pal.part_prop_set_bool(&io, HsmPartPropId::BK3_INITIALIZED, true)
+            .unwrap();
+        pal.part_prop_set_u8(
+            &io,
+            HsmPartPropId::BK3_PROVISIONING_STATUS,
+            HsmFipsProvStatus::SecureApproved as u8,
+        )
+        .unwrap();
         pal
     }
 

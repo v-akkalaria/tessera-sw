@@ -55,7 +55,7 @@ pub(crate) async fn handle<P: HsmPal>(
     let fips_approved = part_state::part_firmware_fips_approved(pal, io)?;
 
     let resp = cmd_buf.encode_response(|buf| {
-        let frame = TborPartInfoResp::encode(buf, 0, fips_approved)?
+        let frame = TborPartInfoResp::encode_for_request(buf, 0, fips_approved)?
             .device_kind(DeviceKind::Physical)?
             .part_state(PartStateId(part_state_val))?
             .generation(U32::new(generation))?

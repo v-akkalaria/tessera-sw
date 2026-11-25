@@ -27,18 +27,17 @@ pub(crate) async fn get_establish_cred_encryption_key<'p, P: HsmPal>(
     let _body: DdiGetEstablishCredEncryptionKeyReq = decoder.decode_data()?;
 
     let _lock = pal.partition_lock(io).await?;
-    // BK3 phases may consume/recreate the tunnel key, but a completed
+    // BK3 phases may consume/recreate the establish-credential key, but a completed
     // application credential establishment closes this provisioning path.
     if crate::part_state::part_is_credential_set(pal, io)? {
         return Err(HsmError::VaultAppLimitReached);
     }
-    pal.part_ensure_establish_cred_key(io).await?;
+    super::establish_credential::create_establish_cred_key(pal, io).await?;
 
     // Query sizes, then encode header + frame with reserved slots.
     let pub_key_len = crate::part_state::part_establish_cred_pub_key(pal, io)?.len();
     let nonce_len = crate::part_state::part_nonce(pal, io)?.len();
 
-    let digest = pal.dma_alloc(io, HsmHashAlgo::Sha384.digest_len())?;
     let id_priv_key = pal.vault_key(io, crate::part_state::part_id_key_id(pal, io)?)?;
 
     let (resp, layout) = pal.dma_alloc_var_with(io, |buf| {
@@ -69,22 +68,13 @@ pub(crate) async fn get_establish_cred_encryption_key<'p, P: HsmPal>(
         frame.nonce.copy_from_slice(&n[..nonce_len]);
     }
 
-    // Hash pub key directly in wire-LE (PAL's `ecc_sign` digest
-    // contract), then sign into the signature slot.
-    pal.hash(
+    // Sign SHA-384 of the pub key in place in the signature slot.
+    super::sign_p384_in_slot(
+        pal,
         io,
-        HsmHashAlgo::Sha384,
-        frame.pub_key.raw,
-        HsmDigestForm::Operand,
-        Some(digest),
-    )
-    .await?;
-    pal.ecc_sign(
-        io,
-        HsmEccCurve::P384,
         id_priv_key,
-        digest,
-        Some(frame.pub_key_signature),
+        frame.pub_key.raw,
+        frame.pub_key_signature,
     )
     .await?;
 
